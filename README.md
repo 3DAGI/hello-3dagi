@@ -1,17 +1,26 @@
-# 3DAGI
+# SWARM Protocol ⚡
 
-Decentralized AI Compute Infrastructure.
+**Decentralized AI Compute Mining Marketplace** on Solana.
 
-## About
+## What is SWARM?
 
-3DAGI is building the next-generation decentralized compute marketplace for AI workloads.  
-SWARM Protocol enables peer-to-peer GPU compute trading with on-chain settlement.
+SWARM is a peer-to-peer compute marketplace where **GPU providers** earn token rewards for serving AI inference workloads, and **AI developers** access decentralized compute at market rates — no cloud vendor lock-in.
 
-## Links
+### Key Features
 
-- GitHub: [@3DAGI](https://github.com/3DAGI)
-- Protocol: SWARM (Solana-based)
+- **Solo + Pool Mining** — Mine solo or stake SOL to join a mining pool
+- **On-Chain Rewards** — Every compute contribution settled on Solana
+- **Deflationary Tokenomics** — Buyback-and-burn mechanism
+- **4-Tier Staking** — Stake to earn boosted rewards
+
+### Network
+
+- **Protocol**: Solana (Anchor 0.30)
+- **Mining**: Dual-mode (solo and pooled)
+- **Incentives**: Proof-of-Compute with staking bonuses
 
 ---
 
-*Genesis block: March 2026*
+*Follow for launch updates. No code — just compute.*
+
+[SWARM Protocol] · [Solana] · [@3DAGI]
