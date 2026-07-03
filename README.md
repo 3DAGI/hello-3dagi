@@ -1,11 +1,14 @@
 # Pixel Drag Racer 🏁
 
-A simple **pixel-art drag racing game for mobile** — tachometer, manual gearbox,
-christmas-tree start, quarter-mile races against AI opponents.
+A simple **pixel-art drag racing game for mobile** (landscape) — tachometer, manual
+gearbox, christmas-tree start, quarter-mile races against AI opponents, and a garage
+full of upgrades.
 
 - **Gameplay**: rev at the tree, launch in the sweet spot, shift at redline. Perfect
   launches and perfect shifts win races. Three opponent classes (STREET / PRO / BOSS),
   best times saved locally.
+- **Garage**: earn cash from races (wins, perfect launches/shifts, new bests) and
+  upgrade 6 parts over 5 levels each — Engine, Turbo, Exhaust, Tires, Gearbox, Weight.
 - **Tech**: HTML5 canvas + vanilla JS (Vite), wrapped with Capacitor for native builds.
 - **iOS / TestFlight**: native Xcode project included — see [docs/IOS_BUILD.md](docs/IOS_BUILD.md).
 - **Roadmap**: Android APK for the Solana Seeker dApp Store with on-chain results.

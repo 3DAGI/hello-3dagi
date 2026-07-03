@@ -36,16 +36,11 @@ body {
   background: #07070f;
 }
 
+/* --- landscape touch controls: shift left thumb, gas right thumb --- */
 #controls {
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 2.5%;
-  height: 24%;
-  display: flex;
-  gap: 4%;
-  padding: 0 4%;
-  align-items: stretch;
+  inset: 0;
+  pointer-events: none;
 }
 
 #controls.hidden {
@@ -53,10 +48,15 @@ body {
 }
 
 #shift-col {
-  flex: 1;
+  position: absolute;
+  left: 2.5%;
+  bottom: 3%;
+  width: 19%;
+  height: 36%;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+  pointer-events: auto;
 }
 
 .btn {
@@ -70,6 +70,7 @@ body {
   touch-action: none;
   cursor: pointer;
   box-shadow: 0 4px 0 #000;
+  pointer-events: auto;
 }
 
 .btn:active, .btn.pressed {
@@ -80,7 +81,7 @@ body {
 
 .btn.shift {
   flex: 2;
-  font-size: clamp(12px, 4.5vmin, 22px);
+  font-size: clamp(10px, 3.4vmin, 20px);
   border-color: #2e6ea8;
   color: #9fd4ff;
 }
@@ -92,9 +93,33 @@ body {
 }
 
 .btn.gas {
-  flex: 1.4;
-  font-size: clamp(16px, 6vmin, 30px);
+  position: absolute;
+  right: 2.5%;
+  bottom: 3%;
+  width: 21%;
+  height: 36%;
+  font-size: clamp(14px, 5.5vmin, 30px);
   border-color: #b03030;
   color: #ff9a9a;
   background: #2a1420;
+}
+
+/* --- portrait hint on phones --- */
+#rotate {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: #07070f;
+  color: #d8d8f0;
+  font-size: 18px;
+  font-weight: bold;
+  letter-spacing: 2px;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  z-index: 10;
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  #rotate { display: flex; }
 }
