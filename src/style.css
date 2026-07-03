@@ -92,16 +92,41 @@ body {
   color: #888;
 }
 
-.btn.gas {
+#gas-col {
   position: absolute;
   right: 2.5%;
   bottom: 3%;
   width: 21%;
-  height: 36%;
+  height: 40%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.btn.gas {
+  flex: 2.2;
   font-size: clamp(14px, 5.5vmin, 30px);
   border-color: #b03030;
   color: #ff9a9a;
   background: #2a1420;
+}
+
+.btn.nos {
+  flex: 1;
+  font-size: clamp(10px, 3.2vmin, 18px);
+  border-color: #7a3cff;
+  color: #c9a8ff;
+  background: #1d1230;
+}
+
+.btn.nos.hidden {
+  display: none;
+}
+
+.btn.nos.used {
+  opacity: 0.35;
+  filter: none;
 }
 
 /* --- portrait hint on phones --- */
