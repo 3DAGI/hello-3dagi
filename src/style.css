@@ -1,0 +1,100 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: #07070f;
+  overflow: hidden;
+  position: fixed;
+  touch-action: none;
+  overscroll-behavior: none;
+  font-family: 'Courier New', Courier, monospace;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#wrap {
+  position: relative;
+}
+
+#game {
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  background: #07070f;
+}
+
+#controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 2.5%;
+  height: 24%;
+  display: flex;
+  gap: 4%;
+  padding: 0 4%;
+  align-items: stretch;
+}
+
+#controls.hidden {
+  display: none;
+}
+
+#shift-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.btn {
+  border: 3px solid #3a3a5c;
+  border-radius: 6px;
+  background: #14142a;
+  color: #d8d8f0;
+  font-family: inherit;
+  font-weight: bold;
+  letter-spacing: 1px;
+  touch-action: none;
+  cursor: pointer;
+  box-shadow: 0 4px 0 #000;
+}
+
+.btn:active, .btn.pressed {
+  transform: translateY(3px);
+  box-shadow: 0 1px 0 #000;
+  filter: brightness(1.5);
+}
+
+.btn.shift {
+  flex: 2;
+  font-size: clamp(12px, 4.5vmin, 22px);
+  border-color: #2e6ea8;
+  color: #9fd4ff;
+}
+
+.btn.shift.small {
+  flex: 1;
+  border-color: #444;
+  color: #888;
+}
+
+.btn.gas {
+  flex: 1.4;
+  font-size: clamp(16px, 6vmin, 30px);
+  border-color: #b03030;
+  color: #ff9a9a;
+  background: #2a1420;
+}

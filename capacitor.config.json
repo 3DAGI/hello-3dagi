@@ -1,0 +1,10 @@
+{
+  "appId": "io.threedagi.pixeldrag",
+  "appName": "Pixel Drag Racer",
+  "webDir": "dist",
+  "backgroundColor": "#07070f",
+  "ios": {
+    "contentInset": "never",
+    "backgroundColor": "#07070f"
+  }
+}

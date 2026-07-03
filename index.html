@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#07070f" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%2307070f'/><rect x='2' y='7' width='12' height='4' fill='%23e03a3a'/><rect x='4' y='4' width='7' height='3' fill='%23e03a3a'/><rect x='3' y='11' width='3' height='3' fill='%23111'/><rect x='10' y='11' width='3' height='3' fill='%23111'/></svg>" />
+  <title>Pixel Drag Racer</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="270" height="480"></canvas>
+    <div id="controls" class="hidden">
+      <div id="shift-col">
+        <button id="shiftUp" class="btn shift">SHIFT<br>&#9650;</button>
+        <button id="shiftDown" class="btn shift small">&#9660;</button>
+      </div>
+      <button id="gas" class="btn gas">GAS</button>
+    </div>
+  </div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

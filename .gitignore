@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Pixel Drag Racer (Node / Vite / Capacitor) ---
+node_modules/
+dist/
+.vite/
