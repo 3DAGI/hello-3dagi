@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Node / JS
+node_modules/
+app/dist/
+.vite/
+
+# Solana / Anchor
+target/
+.anchor/
+test-ledger/

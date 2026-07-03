@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/config.ts","./src/main.tsx","./src/polyfills.ts","./src/chain/swarmSpin.ts","./src/game/engine.ts","./src/wallet/WalletContext.tsx"],"version":"5.9.3"}
