@@ -226,3 +226,4 @@ app/dist/
 target/
 .anchor/
 test-ledger/
+*.tsbuildinfo
