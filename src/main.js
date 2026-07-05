@@ -4,7 +4,15 @@
 // manual gearbox, christmas-tree start, quarter mile.
 // ============================================================
 
-import { sol, mwaSupported, connectWallet, disconnectWallet, postRecord, CLUSTER } from './solana.js';
+import { sol, mwaSupported, connectWallet, disconnectWallet, postRecord, CLUSTER, getPublicKey } from './solana.js';
+import {
+  getConfig, getBoard, getPlayer, getDuel, getFuelBalance,
+  submitTimeOnChain, claimFuel, registerWithReferrer,
+  createDuelIx, joinDuelIx, submitDuelTimeIx, settleDuelIx, cancelDuelIx,
+  DUEL_STAKES, FUEL_DECIMALS,
+} from './chain.js';
+import { sendIxs } from './solana.js';
+import { PublicKey } from '@solana/web3.js';
 
 const W = 480;
 const H = 270;
@@ -249,6 +257,13 @@ const G = {
   best: {},              // best ET per car id
   career: 0,             // next career stage index
   earned: null,
+  // on-chain hub
+  chainTab: 'wallet',    // wallet | board | duel | ref
+  chainCfg: null, chainPlayer: null, fuel: 0,
+  board: null, chainLoading: false, chainMsg: '',
+  duel: null,            // {creator, seed, role, submitted} (persisted)
+  duelInfo: null, duelStakeIdx: 1,
+  pendingReferrer: '',   // applied at on-chain registration (persisted)
   // fx
   flash: null,
   particles: [],
@@ -272,6 +287,8 @@ function loadSave() {
       }
       if (s.best) G.best = s.best;
       if (typeof s.career === 'number') G.career = Math.min(CAREER.length, s.career);
+      if (s.duel && s.duel.creator && typeof s.duel.seed === 'number') G.duel = s.duel;
+      if (typeof s.pendingReferrer === 'string') G.pendingReferrer = s.pendingReferrer;
     }
   } catch {}
   for (const id of G.owned) if (!G.garage[id]) G.garage[id] = freshParts();
@@ -281,6 +298,7 @@ function save() {
     localStorage.setItem('pdr_save', JSON.stringify({
       v: 2, cash: G.cash, carId: G.carId, owned: G.owned,
       garage: G.garage, best: G.best, career: G.career,
+      duel: G.duel, pendingReferrer: G.pendingReferrer,
     }));
   } catch {}
 }
@@ -416,8 +434,10 @@ function tapAnywhere(x, y, isKey) {
   if (G.screen === 'results') {
     const h = hitAt(x, y);
     if (h && h.action === 'postrecord') { postRaceRecord(); return; }
+    if (h && h.action === 'duelsubmit') { doDuelSubmit(); return; }
     if (G.time > 0.6) {
       if (G.mode === 'career') gotoScreen('career');
+      else if (G.mode === 'duel') { gotoScreen('wallet'); G.chainTab = 'duel'; refreshChain(); }
       else gotoScreen('menu');
     }
     return;
@@ -439,8 +459,162 @@ function tapAnywhere(x, y, isKey) {
     case 'dealernext': G.dealerIdx = (G.dealerIdx + 1) % CARS.length; break;
     case 'dealeraction': dealerAction(); break;
     case 'connect': doConnect(); break;
-    case 'disconnect': disconnectWallet(); setFlash('WALLET DISCONNECTED', PAL.dim); break;
+    case 'disconnect': disconnectWallet(); G.chainPlayer = null; G.fuel = 0; setFlash('WALLET DISCONNECTED', PAL.dim); break;
     case 'postbest': postBestRecord(); break;
+    case 'chaintab': G.chainTab = h.idx; refreshChain(); break;
+    case 'chainrefresh': refreshChain(true); break;
+    case 'claimfuel': doClaim(); break;
+    case 'submitboard': doSubmitBoard(); break;
+    case 'duelstake': G.duelStakeIdx = (G.duelStakeIdx + 1) % DUEL_STAKES.length; break;
+    case 'duelcreate': doDuelCreate(); break;
+    case 'dueljoin': doDuelJoin(); break;
+    case 'duelrace': startDuelRace(); break;
+    case 'duelsettle': doDuelSettle(); break;
+    case 'duelcancel': doDuelCancel(); break;
+    case 'duelclear': G.duel = null; G.duelInfo = null; save(); break;
+    case 'copyaddr': copyMyAddress(); break;
+    case 'copyduel': copyDuelCode(); break;
+    case 'setref': doSetReferrer(); break;
+  }
+}
+
+// ------------------------------------------------------------
+// On-chain hub actions (leaderboard / $FUEL / duels / referrals)
+// ------------------------------------------------------------
+async function refreshChain(force) {
+  if (G.chainLoading) return;
+  G.chainLoading = true;
+  G.chainMsg = '';
+  try {
+    if (force || !G.chainCfg) G.chainCfg = await getConfig();
+    if (!G.chainCfg) { G.chainMsg = 'PROGRAM NOT LIVE YET'; return; }
+    if (G.chainTab === 'board' || force) {
+      G.board = await getBoard(G.chainCfg.season);
+    }
+    const me = getPublicKey();
+    if (me) {
+      G.chainPlayer = await getPlayer(me);
+      G.fuel = await getFuelBalance(me);
+    }
+    if (G.duel) {
+      G.duelInfo = await getDuel(new PublicKey(G.duel.creator), G.duel.seed);
+    }
+  } catch {
+    G.chainMsg = 'RPC ERROR - TRY AGAIN';
+  } finally {
+    G.chainLoading = false;
+  }
+}
+
+async function doSubmitBoard() {
+  const best = G.best[G.carId];
+  if (!best) { setFlash('SET A TIME FIRST', '#ff9a5c'); return; }
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) { setFlash(sol.error, PAL.red); return; } }
+  setFlash('SIGNING TX...', PAL.nos);
+  const carIdx = CARS.findIndex(c => c.id === G.carId);
+  const sig = await submitTimeOnChain(Math.round(best * 1000), Math.max(0, carIdx), G.pendingReferrer);
+  setFlash(sig ? 'TIME ON THE BOARD!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+async function doClaim() {
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await claimFuel();
+  setFlash(sig ? 'FUEL CLAIMED!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+async function doDuelCreate() {
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  const me = getPublicKey();
+  const seed = 1000 + Math.floor(Math.random() * 9000);
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([createDuelIx(me, seed, DUEL_STAKES[G.duelStakeIdx])]);
+  if (!sig) { setFlash(sol.error, PAL.red); return; }
+  G.duel = { creator: me.toBase58(), seed, role: 'creator', submitted: false };
+  save();
+  copyDuelCode();
+  refreshChain(true);
+}
+
+async function doDuelJoin() {
+  let code = '';
+  try { code = (await navigator.clipboard.readText()).trim(); } catch {}
+  const m = code.match(/^([1-9A-HJ-NP-Za-km-z]{32,44})\.(\d{4})$/);
+  if (!m) { setFlash('COPY A DUEL CODE FIRST', '#ff9a5c'); return; }
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  const creator = new PublicKey(m[1]);
+  const seed = parseInt(m[2], 10);
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([joinDuelIx(getPublicKey(), creator, seed)]);
+  if (!sig) { setFlash(sol.error, PAL.red); return; }
+  G.duel = { creator: m[1], seed, role: 'opponent', submitted: false };
+  save();
+  setFlash('DUEL JOINED - RACE!', PAL.green);
+  refreshChain(true);
+}
+
+async function doDuelSubmit() {
+  if (!G.duel || G.duel.submitted) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([
+    submitDuelTimeIx(getPublicKey(), new PublicKey(G.duel.creator), G.duel.seed, Math.round(G.et * 1000)),
+  ]);
+  if (!sig) { setFlash(sol.error, PAL.red); return; }
+  G.duel.submitted = true;
+  save();
+  setFlash('DUEL TIME SUBMITTED!', PAL.green);
+  refreshChain(true);
+}
+
+async function doDuelSettle() {
+  if (!G.duelInfo) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([settleDuelIx(getPublicKey(), G.duelInfo)]);
+  setFlash(sig ? 'DUEL SETTLED!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) { G.duel = null; G.duelInfo = null; save(); refreshChain(true); }
+}
+
+async function doDuelCancel() {
+  if (!G.duel || G.duel.role !== 'creator') return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([cancelDuelIx(getPublicKey(), G.duel.seed)]);
+  setFlash(sig ? 'STAKE REFUNDED' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) { G.duel = null; G.duelInfo = null; save(); }
+}
+
+function copyDuelCode() {
+  if (!G.duel) return;
+  const code = G.duel.creator + '.' + G.duel.seed;
+  try { navigator.clipboard.writeText(code); setFlash('DUEL CODE COPIED - SEND IT!', PAL.green); }
+  catch { setFlash('COPY FAILED', PAL.red); }
+}
+
+function copyMyAddress() {
+  if (!sol.address) return;
+  try { navigator.clipboard.writeText(sol.address); setFlash('ADDRESS COPIED', PAL.green); }
+  catch { setFlash('COPY FAILED', PAL.red); }
+}
+
+async function doSetReferrer() {
+  if (G.chainPlayer) { setFlash('ALREADY REGISTERED ON-CHAIN', '#ff9a5c'); return; }
+  let addr = '';
+  try { addr = (await navigator.clipboard.readText()).trim(); } catch {}
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) { setFlash('COPY A WALLET ADDRESS FIRST', '#ff9a5c'); return; }
+  if (addr === sol.address) { setFlash('NOT YOURSELF ;)', '#ff9a5c'); return; }
+  G.pendingReferrer = addr;
+  save();
+  if (sol.connected) {
+    setFlash('SIGNING TX...', PAL.nos);
+    const sig = await registerWithReferrer(addr);
+    setFlash(sig ? 'REFERRER SET ON-CHAIN!' : sol.error || 'SAVED - APPLIES ON FIRST TX', sig ? PAL.green : PAL.dim);
+    if (sig) refreshChain(true);
+  } else {
+    setFlash('REFERRER SAVED - APPLIES ON FIRST TX', PAL.green);
   }
 }
 
@@ -486,6 +660,7 @@ function gotoScreen(name) {
   G.screen = name;
   G.time = 0;
   controls.classList.add('hidden');
+  if (name === 'wallet') refreshChain();
 }
 
 // ============================================================
@@ -568,6 +743,17 @@ function startCareerRace() {
   beginStaging();
 }
 
+// PvP duel: a solo run against the clock — the rival's time comes
+// from their own on-chain submission, settle picks the lower ET
+function startDuelRace() {
+  if (!G.duel || G.duel.submitted) return;
+  G.mode = 'duel';
+  G.aiEt = 9999;
+  G.oppName = 'DUEL RUN';
+  G.oppCar = S.car;
+  beginStaging();
+}
+
 const TREE = { amber1: 1.2, amber2: 1.8, amber3: 2.4, green: 3.0 };
 
 function launch() {
@@ -637,6 +823,10 @@ function applyRewards() {
   const won = G.et < G.aiEt;
   const lines = [];
   let total;
+  if (G.mode === 'duel') {
+    G.earned = { total: 0, lines: ['DUEL RUN - SUBMIT YOUR TIME ON-CHAIN'] };
+    return;
+  }
   if (G.mode === 'career') {
     const stage = CAREER[G.career];
     if (won) {
@@ -754,6 +944,7 @@ function updatePlayer(dt) {
 }
 
 function updateAI(dt) {
+  if (G.mode === 'duel') return; // rival races on their own device
   const t = G.raceT;
   const p = QUARTER_MILE * Math.pow(Math.min(t, G.aiEt) / G.aiEt, 1.55);
   if (t <= G.aiEt) {
@@ -1439,72 +1630,265 @@ function drawDealer() {
 }
 
 // ------------------------------------------------------------
-// Wallet screen — Solana on-chain records (Seeker / Android)
+// On-chain hub: wallet / season leaderboard / PvP duels / referrals
 // ------------------------------------------------------------
+function fmtDur(sec) {
+  if (sec <= 0) return 'ENDED';
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  return d > 0 ? d + 'D ' + h + 'H' : h > 0 ? h + 'H ' + m + 'M' : m + 'M';
+}
+
+function chainButton(bx, by, bw, bh, label, color, action, idx) {
+  panel(bx, by, bw, bh, color);
+  ctx.fillStyle = color;
+  pixTextCenter(label, by + (bh - 9) / 2, 9, bx + bw / 2);
+  hits.push({ x: bx, y: by, w: bw, h: bh, action, idx });
+}
+
 function drawWallet() {
   starBg();
   hits.length = 0;
   ctx.fillStyle = PAL.text;
-  pixText('WALLET', 14, 10, 16);
+  pixText('ON-CHAIN', 14, 10, 15);
   ctx.fillStyle = PAL.nos;
-  pixText('SOLANA · ' + CLUSTER.toUpperCase(), 120, 15, 9);
-  cashTag();
+  pixText('SOLANA · ' + CLUSTER.toUpperCase(), 128, 14, 8);
+  ctx.fillStyle = PAL.cash;
+  const fuelStr = 'FUEL ' + Math.floor(G.fuel);
+  ctx.font = 'bold 11px "Courier New", monospace';
+  pixText(fuelStr, W - 20 - ctx.measureText(fuelStr).width, 12, 11);
 
-  panel(60, 44, 360, 140, PAL.nos);
+  // tabs
+  const tabs = [
+    { id: 'wallet', label: 'WALLET' },
+    { id: 'board', label: 'BOARD' },
+    { id: 'duel', label: 'DUEL' },
+    { id: 'ref', label: 'REFERRAL' },
+  ];
+  tabs.forEach((t, i) => {
+    const bx = 14 + i * 102, by = 30, bw = 96, bh = 20;
+    const active = G.chainTab === t.id;
+    panel(bx, by, bw, bh, active ? PAL.nos : PAL.border);
+    ctx.fillStyle = active ? PAL.nos : PAL.dim;
+    pixTextCenter(t.label, by + 6, 8, bx + bw / 2);
+    hits.push({ x: bx, y: by, w: bw, h: bh, action: 'chaintab', idx: t.id });
+  });
+  chainButton(422, 30, 44, 20, G.chainLoading ? '...' : 'SYNC', PAL.dim, 'chainrefresh');
 
-  if (!mwaSupported) {
-    ctx.fillStyle = PAL.dim;
-    pixTextCenter('ON-CHAIN RECORDS RUN ON THE', 76, 10);
-    pixTextCenter('ANDROID / SOLANA SEEKER BUILD', 94, 10);
-    ctx.fillStyle = PAL.text;
-    pixTextCenter('YOUR BEST TIMES GET SIGNED BY YOUR', 122, 8);
-    pixTextCenter('WALLET AND WRITTEN TO SOLANA', 136, 8);
-  } else if (!sol.connected) {
-    ctx.fillStyle = PAL.text;
-    pixTextCenter('CONNECT YOUR SOLANA WALLET', 66, 11);
-    ctx.fillStyle = PAL.dim;
-    pixTextCenter('SIGN YOUR BEST 1/4 MILE TIMES', 86, 8);
-    pixTextCenter('AND PUT THEM ON-CHAIN', 98, 8);
-    const bx = 140, by = 118, bw = 200, bh = 34;
-    panel(bx, by, bw, bh, sol.busy ? PAL.dim : PAL.green);
-    ctx.fillStyle = sol.busy ? PAL.dim : PAL.green;
-    pixTextCenter(sol.busy ? 'OPENING...' : 'CONNECT WALLET', by + 11, 12);
-    if (!sol.busy) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'connect' });
-  } else {
-    ctx.fillStyle = PAL.green;
-    pixTextCenter('CONNECTED', 56, 10);
-    ctx.fillStyle = PAL.text;
-    pixTextCenter(sol.shortAddress, 70, 12);
-    const best = G.best[G.carId];
-    ctx.fillStyle = PAL.dim;
-    pixTextCenter(S.car.name + (best ? ' · BEST ' + best.toFixed(3) + 's' : ' · NO TIME SET'), 90, 8);
-    const bx = 100, by = 108, bw = 280, bh = 30;
-    const can = best && !sol.busy;
-    panel(bx, by, bw, bh, can ? PAL.green : PAL.dim);
-    ctx.fillStyle = can ? PAL.green : PAL.dim;
-    pixTextCenter(sol.busy ? 'SIGNING...' : 'POST BEST TIME ON-CHAIN', by + 10, 10);
-    if (can) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'postbest' });
+  const tab = G.chainTab;
+  if (tab === 'wallet') drawChainWallet();
+  else if (tab === 'board') drawChainBoard();
+  else if (tab === 'duel') drawChainDuel();
+  else drawChainRef();
 
-    if (sol.lastSig) {
-      ctx.fillStyle = PAL.dim;
-      pixTextCenter('TX ' + sol.lastSig.slice(0, 8) + '..' + sol.lastSig.slice(-8), 146, 7);
-    }
-    const dx = 190, dy = 160, dw = 100, dh = 18;
-    panel(dx, dy, dw, dh);
-    ctx.fillStyle = PAL.dim;
-    pixTextCenter('DISCONNECT', dy + 5, 8);
-    hits.push({ x: dx, y: dy, w: dw, h: dh, action: 'disconnect' });
-  }
-
-  if (sol.error) {
+  if (G.chainMsg) {
+    ctx.fillStyle = PAL.amber;
+    pixTextCenter(G.chainMsg, 200, 8);
+  } else if (sol.error) {
     ctx.fillStyle = PAL.red;
-    pixTextCenter(sol.error, 196, 8);
+    pixTextCenter(sol.error, 200, 8);
   }
-  ctx.fillStyle = PAL.dim;
-  pixTextCenter('MEMO TX · FEE PAID BY YOUR WALLET', 212, 7);
 
   backButton();
   drawHUDFlash();
+}
+
+function drawChainWallet() {
+  if (!mwaSupported) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('WALLET ACTIONS RUN ON THE', 80, 10);
+    pixTextCenter('ANDROID / SOLANA SEEKER BUILD', 96, 10);
+    ctx.fillStyle = PAL.text;
+    pixTextCenter('LEADERBOARD IS LIVE ON EVERY PLATFORM', 124, 8);
+    return;
+  }
+  if (!sol.connected) {
+    ctx.fillStyle = PAL.text;
+    pixTextCenter('CONNECT YOUR SOLANA WALLET', 70, 11);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('EARN $FUEL FOR RECORDS · STAKE IT IN DUELS', 90, 8);
+    chainButton(140, 112, 200, 32, sol.busy ? 'OPENING...' : 'CONNECT WALLET', sol.busy ? PAL.dim : PAL.green, 'connect');
+    return;
+  }
+  ctx.fillStyle = PAL.green;
+  pixText('CONNECTED', 24, 62, 9);
+  ctx.fillStyle = PAL.text;
+  pixText(sol.shortAddress, 110, 60, 12);
+  chainButton(320, 58, 70, 16, 'COPY', PAL.dim, 'copyaddr');
+  chainButton(398, 58, 68, 16, 'LOG OUT', PAL.dim, 'disconnect');
+
+  const p = G.chainPlayer;
+  ctx.fillStyle = PAL.dim;
+  pixText('FUEL BALANCE', 24, 88, 8);
+  ctx.fillStyle = PAL.cash;
+  pixText(G.fuel.toFixed(2), 130, 86, 12);
+  ctx.fillStyle = PAL.dim;
+  pixText('CLAIMABLE', 24, 108, 8);
+  const claimable = p ? p.claimable / 10 ** FUEL_DECIMALS : 0;
+  ctx.fillStyle = claimable > 0 ? PAL.green : PAL.dim;
+  pixText(claimable.toFixed(2), 130, 106, 12);
+  if (p) {
+    ctx.fillStyle = PAL.dim;
+    pixText('SEASON RACES ' + p.races + ' · SEASON BEST ' +
+      (p.bestEtMs === 0xffffffff ? '--' : (p.bestEtMs / 1000).toFixed(3) + 's'), 24, 128, 8);
+  } else {
+    ctx.fillStyle = PAL.dim;
+    pixText('NOT REGISTERED YET - SUBMIT A TIME TO START', 24, 128, 8);
+  }
+  if (claimable > 0) {
+    chainButton(280, 96, 186, 30, sol.busy ? 'SIGNING...' : 'CLAIM $FUEL', PAL.cash, 'claimfuel');
+  }
+  if (sol.lastSig) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('TX ' + sol.lastSig.slice(0, 8) + '..' + sol.lastSig.slice(-8), 152, 7);
+  }
+}
+
+function drawChainBoard() {
+  const cfg = G.chainCfg;
+  if (!cfg) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter(G.chainLoading ? 'LOADING...' : 'TAP SYNC TO LOAD THE BOARD', 110, 10);
+    return;
+  }
+  const now = Date.now() / 1000;
+  ctx.fillStyle = PAL.text;
+  pixText('SEASON ' + cfg.season, 24, 58, 11);
+  ctx.fillStyle = PAL.amber;
+  pixText('ENDS IN ' + fmtDur(cfg.seasonEnd - now), 130, 60, 8);
+  ctx.fillStyle = PAL.dim;
+  pixText('TOP PRIZE ' + (cfg.baseReward * 500 / 10 ** FUEL_DECIMALS).toFixed(0) + ' FUEL', 300, 60, 8);
+
+  const entries = G.board ? G.board.entries : [];
+  if (entries.length === 0) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('NO TIMES YET - BE THE FIRST', 120, 9);
+  }
+  entries.slice(0, 8).forEach((e, i) => {
+    const y = 76 + i * 15;
+    const mine = sol.address && e.wallet === sol.address;
+    ctx.fillStyle = i === 0 ? PAL.cash : mine ? PAL.green : PAL.dim;
+    pixText(String(i + 1).padStart(2), 24, y, 9);
+    ctx.fillStyle = mine ? PAL.green : PAL.text;
+    pixText(e.wallet.slice(0, 4) + '..' + e.wallet.slice(-4), 48, y, 9);
+    ctx.fillStyle = mine ? PAL.green : PAL.text;
+    pixText((e.etMs / 1000).toFixed(3) + 's', 170, y, 9);
+    ctx.fillStyle = PAL.dim;
+    pixText((CARS[e.car] ? CARS[e.car].name : '?'), 250, y, 8);
+  });
+
+  const best = G.best[G.carId];
+  ctx.fillStyle = PAL.dim;
+  pixText('YOUR BEST', 360, 80, 8);
+  ctx.fillStyle = PAL.text;
+  pixText(best ? best.toFixed(3) + 's' : '--', 360, 92, 10);
+  if (mwaSupported && best) {
+    chainButton(352, 112, 114, 28, sol.busy ? 'SIGNING...' : 'SUBMIT', PAL.green, 'submitboard');
+  }
+}
+
+function drawChainDuel() {
+  if (!mwaSupported) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('PVP DUELS RUN ON THE ANDROID / SEEKER BUILD', 110, 9);
+    return;
+  }
+  const d = G.duel;
+  if (!d) {
+    ctx.fillStyle = PAL.text;
+    pixTextCenter('STAKE $FUEL · BEST 1/4 MILE TAKES THE POT', 62, 9);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('3% RAKE GETS BURNED', 76, 7);
+    chainButton(60, 96, 110, 32, 'STAKE: ' + DUEL_STAKES[G.duelStakeIdx], PAL.cash, 'duelstake');
+    chainButton(185, 96, 130, 32, sol.busy ? 'SIGNING...' : 'CREATE DUEL', PAL.green, 'duelcreate');
+    chainButton(330, 96, 130, 32, 'JOIN (PASTE)', PAL.nos, 'dueljoin');
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('CREATE COPIES A CODE - SEND IT TO YOUR RIVAL', 142, 7);
+    pixTextCenter('JOIN READS THE CODE FROM YOUR CLIPBOARD', 154, 7);
+    return;
+  }
+  const info = G.duelInfo;
+  ctx.fillStyle = PAL.text;
+  pixText('DUEL #' + d.seed + ' · ' + (d.role === 'creator' ? 'YOU CREATED' : 'YOU JOINED'), 24, 60, 9);
+  chainButton(370, 56, 96, 18, 'COPY CODE', PAL.dim, 'copyduel');
+  if (!info) {
+    ctx.fillStyle = PAL.dim;
+    pixText(G.chainLoading ? 'LOADING DUEL...' : 'TAP SYNC TO UPDATE', 24, 80, 8);
+  } else {
+    ctx.fillStyle = PAL.cash;
+    pixText('POT ' + (2 * info.stake / 10 ** FUEL_DECIMALS).toFixed(0) + ' FUEL', 24, 78, 9);
+    const oppJoined = info.opponent.toBase58() !== '11111111111111111111111111111111';
+    ctx.fillStyle = oppJoined ? PAL.green : PAL.amber;
+    pixText(oppJoined ? 'RIVAL JOINED' : 'WAITING FOR RIVAL...', 130, 78, 9);
+    const meCreator = d.role === 'creator';
+    const myEt = meCreator ? info.creatorEtMs : info.opponentEtMs;
+    const theirEt = meCreator ? info.opponentEtMs : info.creatorEtMs;
+    ctx.fillStyle = PAL.dim;
+    pixText('YOU:   ' + (myEt ? (myEt / 1000).toFixed(3) + 's' : 'NO RUN YET'), 24, 96, 9);
+    pixText('RIVAL: ' + (theirEt ? (theirEt / 1000).toFixed(3) + 's' : 'NO RUN YET'), 24, 110, 9);
+    if (info.settled) {
+      ctx.fillStyle = PAL.green;
+      pixText('SETTLED - GG!', 24, 128, 10);
+      chainButton(330, 124, 136, 24, 'NEW DUEL', PAL.green, 'duelclear');
+    } else {
+      const both = info.creatorEtMs > 0 && info.opponentEtMs > 0;
+      const expired = Date.now() / 1000 > info.deadline;
+      if (!G.duel.submitted && !myEt) {
+        chainButton(330, 92, 136, 28, 'RACE NOW!', PAL.green, 'duelrace');
+      }
+      if (both || (oppJoined && expired)) {
+        chainButton(330, 126, 136, 26, sol.busy ? 'SIGNING...' : 'SETTLE DUEL', PAL.cash, 'duelsettle');
+      } else if (!oppJoined && expired && meCreator) {
+        chainButton(330, 126, 136, 26, 'CANCEL+REFUND', PAL.red, 'duelcancel');
+      }
+      ctx.fillStyle = PAL.dim;
+      pixText('DEADLINE IN ' + fmtDur(info.deadline - Date.now() / 1000), 24, 146, 7);
+    }
+  }
+  ctx.fillStyle = PAL.dim;
+  pixText('FORGET THIS DUEL', 24, 166, 7);
+  hits.push({ x: 24, y: 162, w: 110, h: 14, action: 'duelclear' });
+}
+
+function drawChainRef() {
+  ctx.fillStyle = PAL.text;
+  pixTextCenter('INVITE RACERS - EARN ' + (G.chainCfg ? G.chainCfg.referralBps / 100 : 5) + '% OF THEIR $FUEL', 60, 9);
+  if (!mwaSupported) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('REFERRALS RUN ON THE ANDROID / SEEKER BUILD', 110, 9);
+    return;
+  }
+  if (sol.connected) {
+    ctx.fillStyle = PAL.dim;
+    pixText('YOUR CODE (= YOUR WALLET)', 24, 84, 8);
+    ctx.fillStyle = PAL.text;
+    pixText(sol.shortAddress, 24, 96, 11);
+    chainButton(200, 90, 120, 24, 'COPY CODE', PAL.green, 'copyaddr');
+    const p = G.chainPlayer;
+    ctx.fillStyle = PAL.dim;
+    pixText('RECRUITS', 24, 126, 8);
+    pixText('EARNED', 150, 126, 8);
+    ctx.fillStyle = PAL.text;
+    pixText(String(p ? p.referralCount : 0), 24, 138, 12);
+    ctx.fillStyle = PAL.cash;
+    pixText((p ? p.referralEarned / 10 ** FUEL_DECIMALS : 0).toFixed(2) + ' FUEL', 150, 138, 12);
+  } else {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('CONNECT YOUR WALLET IN THE WALLET TAB', 96, 8);
+  }
+  ctx.fillStyle = PAL.dim;
+  pixText('GOT INVITED? PASTE YOUR FRIEND\'S CODE:', 24, 164, 8);
+  const refSet = G.chainPlayer && G.chainPlayer.referrer;
+  if (refSet) {
+    ctx.fillStyle = PAL.green;
+    const r = G.chainPlayer.referrer.toBase58();
+    pixText('REFERRER SET: ' + r.slice(0, 4) + '..' + r.slice(-4), 24, 178, 9);
+  } else {
+    chainButton(310, 158, 156, 24, 'SET REFERRER', PAL.nos, 'setref');
+    if (G.pendingReferrer) {
+      ctx.fillStyle = PAL.amber;
+      pixText('PENDING: ' + G.pendingReferrer.slice(0, 4) + '..' + G.pendingReferrer.slice(-4), 24, 178, 8);
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -1543,6 +1927,9 @@ function drawResults() {
   ctx.fillStyle = won ? PAL.green : PAL.red;
   if (G.mode === 'career') {
     pixTextCenter(won ? 'STAGE CLEARED!' : 'STAGE FAILED', 14, 22);
+  } else if (G.mode === 'duel') {
+    ctx.fillStyle = PAL.nos;
+    pixTextCenter('DUEL RUN DONE', 14, 22);
   } else {
     pixTextCenter(won ? 'YOU WIN!' : 'YOU LOSE', 14, 24);
   }
@@ -1550,12 +1937,16 @@ function drawResults() {
   ctx.fillStyle = PAL.text;
   pixTextCenter('YOUR ET    ' + G.et.toFixed(3) + 's', 52, 11);
   pixTextCenter('TRAP SPEED ' + G.trap.toFixed(0) + ' KM/H', 68, 11);
-  ctx.fillStyle = RIVAL_PAL.h;
-  pixTextCenter(G.oppName + '  ' + G.aiEt.toFixed(3) + 's', 84, 11);
-
-  const margin = Math.abs(G.et - G.aiEt);
-  ctx.fillStyle = PAL.dim;
-  pixTextCenter((won ? 'WON' : 'LOST') + ' BY ' + margin.toFixed(3) + 's', 104, 9);
+  if (G.mode !== 'duel') {
+    ctx.fillStyle = RIVAL_PAL.h;
+    pixTextCenter(G.oppName + '  ' + G.aiEt.toFixed(3) + 's', 84, 11);
+    const margin = Math.abs(G.et - G.aiEt);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter((won ? 'WON' : 'LOST') + ' BY ' + margin.toFixed(3) + 's', 104, 9);
+  } else {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('LOWEST ET TAKES THE POT AT SETTLE', 88, 8);
+  }
 
   const best = G.best[G.carId];
   if (best) {
@@ -1579,8 +1970,15 @@ function drawResults() {
     pixTextCenter('TUNE UP IN THE GARAGE AND RETRY', 192, 8);
   }
 
-  // on-chain record button (Seeker / Android with a Solana wallet)
-  if (mwaSupported && G.newBest) {
+  // on-chain buttons (Seeker / Android with a Solana wallet)
+  if (mwaSupported && G.mode === 'duel' && G.duel && !G.duel.submitted) {
+    const bx = 150, by = 228, bw = 180, bh = 24;
+    const can = !sol.busy;
+    panel(bx, by, bw, bh, can ? PAL.green : PAL.dim);
+    ctx.fillStyle = can ? PAL.green : PAL.dim;
+    pixTextCenter(sol.busy ? 'SIGNING...' : 'SUBMIT DUEL TIME', by + 8, 9);
+    if (can) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'duelsubmit' });
+  } else if (mwaSupported && G.newBest) {
     const bx = 150, by = 228, bw = 180, bh = 24;
     const can = !sol.busy;
     panel(bx, by, bw, bh, can ? PAL.nos : PAL.dim);

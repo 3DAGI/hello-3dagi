@@ -89,6 +89,40 @@ export function disconnectWallet() {
   sol.error = '';
 }
 
+export function getConnection() {
+  return new Connection(RPC_URL, 'confirmed');
+}
+
+export function getPublicKey() {
+  return publicKey;
+}
+
+// Signs and sends a transaction built from arbitrary instructions via
+// the mobile wallet. Returns the signature or '' (sol.error set).
+export async function sendIxs(instructions) {
+  if (!mwaSupported || sol.busy) return '';
+  sol.busy = true;
+  sol.error = '';
+  try {
+    const connection = getConnection();
+    const { blockhash } = await connection.getLatestBlockhash();
+    const sig = await transact(async (wallet) => {
+      const payer = await authorize(wallet);
+      const tx = new Transaction({ feePayer: payer, recentBlockhash: blockhash });
+      for (const ix of instructions) tx.add(ix);
+      const sigs = await wallet.signAndSendTransactions({ transactions: [tx] });
+      return sigs[0];
+    });
+    sol.lastSig = sig;
+    return sig;
+  } catch (e) {
+    sol.error = walletError(e);
+    return '';
+  } finally {
+    sol.busy = false;
+  }
+}
+
 // Posts a JSON race record via the Memo program and returns the tx
 // signature, or '' on failure (sol.error is set).
 export async function postRecord(record) {
