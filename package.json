@@ -10,8 +10,12 @@
     "ios": "npm run build && npx cap sync ios && npx cap open ios"
   },
   "dependencies": {
+    "@capacitor/android": "^7.6.7",
     "@capacitor/core": "^7.4.0",
-    "@capacitor/ios": "^7.4.0"
+    "@capacitor/ios": "^7.4.0",
+    "@solana-mobile/mobile-wallet-adapter-protocol-web3js": "^2.2.9",
+    "@solana/web3.js": "^1.98.4",
+    "buffer": "^6.0.3"
   },
   "devDependencies": {
     "@capacitor/cli": "^7.4.0",

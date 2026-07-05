@@ -4,6 +4,8 @@
 // manual gearbox, christmas-tree start, quarter mile.
 // ============================================================
 
+import { sol, mwaSupported, connectWallet, disconnectWallet, postRecord, CLUSTER } from './solana.js';
+
 const W = 480;
 const H = 270;
 const QUARTER_MILE = 402.336; // meters
@@ -412,6 +414,8 @@ function hitAt(x, y) {
 
 function tapAnywhere(x, y, isKey) {
   if (G.screen === 'results') {
+    const h = hitAt(x, y);
+    if (h && h.action === 'postrecord') { postRaceRecord(); return; }
     if (G.time > 0.6) {
       if (G.mode === 'career') gotoScreen('career');
       else gotoScreen('menu');
@@ -434,7 +438,48 @@ function tapAnywhere(x, y, isKey) {
     case 'dealerprev': G.dealerIdx = (G.dealerIdx + CARS.length - 1) % CARS.length; break;
     case 'dealernext': G.dealerIdx = (G.dealerIdx + 1) % CARS.length; break;
     case 'dealeraction': dealerAction(); break;
+    case 'connect': doConnect(); break;
+    case 'disconnect': disconnectWallet(); setFlash('WALLET DISCONNECTED', PAL.dim); break;
+    case 'postbest': postBestRecord(); break;
   }
+}
+
+// ------------------------------------------------------------
+// Solana on-chain actions (Seeker / Android via Mobile Wallet
+// Adapter) — fire-and-forget; sol.* state drives the UI
+// ------------------------------------------------------------
+async function doConnect() {
+  if (sol.busy) return;
+  setFlash('OPENING WALLET...', PAL.nos);
+  const ok = await connectWallet();
+  setFlash(ok ? 'WALLET CONNECTED' : sol.error, ok ? '#5cff8a' : '#ff5c7a');
+}
+
+async function postBestRecord() {
+  if (sol.busy || !sol.connected) return;
+  const best = G.best[G.carId];
+  if (!best) { setFlash('SET A TIME FIRST', '#ff9a5c'); return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await postRecord({
+    g: 'PIXEL-DRAG-RACER', v: 1, kind: 'best',
+    car: G.carId, et: Number(best.toFixed(3)), career: G.career,
+  });
+  setFlash(sig ? 'RECORD ON-CHAIN!' : sol.error, sig ? '#5cff8a' : '#ff5c7a');
+}
+
+async function postRaceRecord() {
+  if (sol.busy) return;
+  if (!sol.connected) {
+    const ok = await connectWallet();
+    if (!ok) { setFlash(sol.error, '#ff5c7a'); return; }
+  }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await postRecord({
+    g: 'PIXEL-DRAG-RACER', v: 1, kind: 'race',
+    car: G.carId, et: Number(G.et.toFixed(3)), trap: Math.round(G.trap),
+    vs: G.oppName, career: G.career,
+  });
+  setFlash(sig ? 'RECORD ON-CHAIN!' : sol.error, sig ? '#5cff8a' : '#ff5c7a');
 }
 
 function gotoScreen(name) {
@@ -1138,12 +1183,13 @@ function drawMenu() {
     { label: 'QUICK RACE', idx: 'quick', color: '#7ec8ff' },
     { label: 'GARAGE', idx: 'garage', color: PAL.cash },
     { label: 'DEALER', idx: 'dealer', color: PAL.green },
+    { label: sol.connected ? 'WALLET ' + sol.shortAddress : 'WALLET', idx: 'wallet', color: PAL.nos },
   ];
   items.forEach((it, i) => {
-    const bx = 24, by = 62 + i * 46, bw = 190, bh = 38;
+    const bx = 24, by = 56 + i * 40, bw = 190, bh = 33;
     panel(bx, by, bw, bh, it.color);
     ctx.fillStyle = it.color;
-    pixText(it.label, bx + 14, by + 12, 13);
+    pixText(it.label, bx + 14, by + 11, 12);
     hits.push({ x: bx, y: by, w: bw, h: bh, action: 'goto', idx: it.idx });
   });
 
@@ -1163,7 +1209,7 @@ function drawMenu() {
   pixTextCenter(Math.round(S.peakTorque) + 'NM · ' + Math.round(S.mass) + 'KG', 168, 8, 345);
 
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('3DAGI · v0.3', 250, 7);
+  pixTextCenter('3DAGI · v0.4 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
   drawHUDFlash();
 }
 
@@ -1393,6 +1439,75 @@ function drawDealer() {
 }
 
 // ------------------------------------------------------------
+// Wallet screen — Solana on-chain records (Seeker / Android)
+// ------------------------------------------------------------
+function drawWallet() {
+  starBg();
+  hits.length = 0;
+  ctx.fillStyle = PAL.text;
+  pixText('WALLET', 14, 10, 16);
+  ctx.fillStyle = PAL.nos;
+  pixText('SOLANA · ' + CLUSTER.toUpperCase(), 120, 15, 9);
+  cashTag();
+
+  panel(60, 44, 360, 140, PAL.nos);
+
+  if (!mwaSupported) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('ON-CHAIN RECORDS RUN ON THE', 76, 10);
+    pixTextCenter('ANDROID / SOLANA SEEKER BUILD', 94, 10);
+    ctx.fillStyle = PAL.text;
+    pixTextCenter('YOUR BEST TIMES GET SIGNED BY YOUR', 122, 8);
+    pixTextCenter('WALLET AND WRITTEN TO SOLANA', 136, 8);
+  } else if (!sol.connected) {
+    ctx.fillStyle = PAL.text;
+    pixTextCenter('CONNECT YOUR SOLANA WALLET', 66, 11);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('SIGN YOUR BEST 1/4 MILE TIMES', 86, 8);
+    pixTextCenter('AND PUT THEM ON-CHAIN', 98, 8);
+    const bx = 140, by = 118, bw = 200, bh = 34;
+    panel(bx, by, bw, bh, sol.busy ? PAL.dim : PAL.green);
+    ctx.fillStyle = sol.busy ? PAL.dim : PAL.green;
+    pixTextCenter(sol.busy ? 'OPENING...' : 'CONNECT WALLET', by + 11, 12);
+    if (!sol.busy) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'connect' });
+  } else {
+    ctx.fillStyle = PAL.green;
+    pixTextCenter('CONNECTED', 56, 10);
+    ctx.fillStyle = PAL.text;
+    pixTextCenter(sol.shortAddress, 70, 12);
+    const best = G.best[G.carId];
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter(S.car.name + (best ? ' · BEST ' + best.toFixed(3) + 's' : ' · NO TIME SET'), 90, 8);
+    const bx = 100, by = 108, bw = 280, bh = 30;
+    const can = best && !sol.busy;
+    panel(bx, by, bw, bh, can ? PAL.green : PAL.dim);
+    ctx.fillStyle = can ? PAL.green : PAL.dim;
+    pixTextCenter(sol.busy ? 'SIGNING...' : 'POST BEST TIME ON-CHAIN', by + 10, 10);
+    if (can) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'postbest' });
+
+    if (sol.lastSig) {
+      ctx.fillStyle = PAL.dim;
+      pixTextCenter('TX ' + sol.lastSig.slice(0, 8) + '..' + sol.lastSig.slice(-8), 146, 7);
+    }
+    const dx = 190, dy = 160, dw = 100, dh = 18;
+    panel(dx, dy, dw, dh);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('DISCONNECT', dy + 5, 8);
+    hits.push({ x: dx, y: dy, w: dw, h: dh, action: 'disconnect' });
+  }
+
+  if (sol.error) {
+    ctx.fillStyle = PAL.red;
+    pixTextCenter(sol.error, 196, 8);
+  }
+  ctx.fillStyle = PAL.dim;
+  pixTextCenter('MEMO TX · FEE PAID BY YOUR WALLET', 212, 7);
+
+  backButton();
+  drawHUDFlash();
+}
+
+// ------------------------------------------------------------
 // HUD overlays
 // ------------------------------------------------------------
 function drawHUDFlash() {
@@ -1422,6 +1537,7 @@ function drawResults() {
   drawDashboard();
   ctx.fillStyle = 'rgba(5,5,12,0.85)';
   ctx.fillRect(0, 0, W, H);
+  hits.length = 0;
 
   const won = G.et < G.aiEt;
   ctx.fillStyle = won ? PAL.green : PAL.red;
@@ -1463,10 +1579,22 @@ function drawResults() {
     pixTextCenter('TUNE UP IN THE GARAGE AND RETRY', 192, 8);
   }
 
+  // on-chain record button (Seeker / Android with a Solana wallet)
+  if (mwaSupported && G.newBest) {
+    const bx = 150, by = 228, bw = 180, bh = 24;
+    const can = !sol.busy;
+    panel(bx, by, bw, bh, can ? PAL.nos : PAL.dim);
+    ctx.fillStyle = can ? PAL.nos : PAL.dim;
+    pixTextCenter(sol.busy ? 'SIGNING...' : 'SAVE RECORD ON-CHAIN', by + 8, 9);
+    if (can) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'postrecord' });
+  }
+
   if (G.time > 0.6) {
     ctx.fillStyle = Math.floor(G.time * 2) % 2 === 0 ? PAL.text : PAL.dim;
     pixTextCenter('TAP TO CONTINUE', 214, 11);
   }
+
+  drawHUDFlash();
 }
 
 // ------------------------------------------------------------
@@ -1480,6 +1608,7 @@ function render() {
     case 'career': drawCareer(); break;
     case 'garage': drawGarage(); break;
     case 'dealer': drawDealer(); break;
+    case 'wallet': drawWallet(); break;
     case 'results': drawResults(); break;
     default:
       drawRaceView();

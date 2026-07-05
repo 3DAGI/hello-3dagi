@@ -15,7 +15,10 @@ full of upgrades.
   a NITROUS system with its own NOS button in the race.
 - **Tech**: HTML5 canvas + vanilla JS (Vite), wrapped with Capacitor for native builds.
 - **iOS / TestFlight**: native Xcode project included — see [docs/IOS_BUILD.md](docs/IOS_BUILD.md).
-- **Roadmap**: Android APK for the Solana Seeker dApp Store with on-chain results.
+- **Solana Seeker / Android**: APK build (`android/`) with on-chain race records —
+  connect the phone's wallet via Mobile Wallet Adapter and sign your best quarter-mile
+  times as Solana memo transactions. Build + dApp Store publishing guide in
+  [docs/SOLANA_SEEKER.md](docs/SOLANA_SEEKER.md).
 
 ```bash
 npm install
