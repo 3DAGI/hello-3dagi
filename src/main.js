@@ -264,6 +264,11 @@ const G = {
   duel: null,            // {creator, seed, role, submitted} (persisted)
   duelInfo: null, duelStakeIdx: 1,
   pendingReferrer: '',   // applied at on-chain registration (persisted)
+  // quality of life
+  ghosts: {},            // best-run position trace per car (persisted)
+  trace: [],             // current run trace (10 samples/s)
+  streak: 0,             // quick-race win streak (persisted)
+  muted: false,          // sound off (persisted)
   // fx
   flash: null,
   particles: [],
@@ -289,6 +294,9 @@ function loadSave() {
       if (typeof s.career === 'number') G.career = Math.min(CAREER.length, s.career);
       if (s.duel && s.duel.creator && typeof s.duel.seed === 'number') G.duel = s.duel;
       if (typeof s.pendingReferrer === 'string') G.pendingReferrer = s.pendingReferrer;
+      if (s.ghosts) G.ghosts = s.ghosts;
+      if (typeof s.streak === 'number') G.streak = s.streak;
+      if (typeof s.muted === 'boolean') G.muted = s.muted;
     }
   } catch {}
   for (const id of G.owned) if (!G.garage[id]) G.garage[id] = freshParts();
@@ -299,8 +307,14 @@ function save() {
       v: 2, cash: G.cash, carId: G.carId, owned: G.owned,
       garage: G.garage, best: G.best, career: G.career,
       duel: G.duel, pendingReferrer: G.pendingReferrer,
+      ghosts: G.ghosts, streak: G.streak, muted: G.muted,
     }));
   } catch {}
+}
+
+// haptic feedback (Android; silently unavailable elsewhere)
+function buzz(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch {}
 }
 
 // ============================================================
@@ -367,7 +381,7 @@ function updateAudio() {
   AU.osc.frequency.setTargetAtTime(f, AU.ctx.currentTime, 0.03);
   AU.osc2.frequency.setTargetAtTime(f * 0.5, AU.ctx.currentTime, 0.03);
   let vol = 0;
-  if (running) {
+  if (running && !G.muted) {
     vol = 0.05 + (G.rpm / S.maxRpm) * 0.10 + (G.throttle ? 0.04 : 0);
     if (G.nosTimer > 0) vol += 0.05;
     if (G.shiftTimer > 0) vol *= 0.3;
@@ -475,6 +489,7 @@ function tapAnywhere(x, y, isKey) {
     case 'copyaddr': copyMyAddress(); break;
     case 'copyduel': copyDuelCode(); break;
     case 'setref': doSetReferrer(); break;
+    case 'togglesound': G.muted = !G.muted; save(); break;
   }
 }
 
@@ -717,6 +732,7 @@ function beginStaging() {
   G.earned = null;
   G.flash = null;
   G.particles = [];
+  G.trace = [];
   controls.classList.remove('hidden');
   const hasNos = G.garage[G.carId].nitro > 0;
   btnNos.classList.toggle('hidden', !hasNos);
@@ -764,6 +780,7 @@ function launch() {
   if (G.launchRpm >= S.launchLo && G.launchRpm <= S.launchHi) {
     G.launchKind = 'perfect';
     setFlash('PERFECT LAUNCH!', '#5cff8a');
+    buzz(60);
   } else if (G.launchRpm < 0.38 * S.redline) {
     G.launchKind = 'bog';
     G.bogTimer = 1.1;
@@ -788,6 +805,7 @@ function shiftUp() {
     G.perfectShifts++;
     setFlash('PERFECT SHIFT!', '#5cff8a');
     spawnFlame(false);
+    buzz(30);
   } else if (early) {
     setFlash('EARLY SHIFT', '#ff9a5c');
   }
@@ -813,6 +831,7 @@ function fireNos() {
   btnNos.classList.add('used');
   setFlash('NOS!', '#c9a8ff');
   G.shake = 0.3;
+  buzz(80);
 }
 
 function setFlash(text, color) {
@@ -839,8 +858,16 @@ function applyRewards() {
     }
   } else {
     const d = DIFFICULTIES[G.difficulty];
-    total = won ? d.win : d.lose;
-    lines.push((won ? 'RACE $' : 'CONSOLATION $') + total);
+    if (won) {
+      G.streak++;
+      const mult = 1 + Math.min(1, (G.streak - 1) * 0.1);
+      total = Math.round(d.win * mult);
+      lines.push('RACE $' + total + (G.streak > 1 ? ' · STREAK x' + G.streak : ''));
+    } else {
+      G.streak = 0;
+      total = d.lose;
+      lines.push('CONSOLATION $' + total);
+    }
   }
   if (G.launchKind === 'perfect') { total += 100; lines.push('LAUNCH $100'); }
   if (G.perfectShifts > 0) {
@@ -931,13 +958,20 @@ function updatePlayer(dt) {
   G.speed = Math.max(0, G.speed + accel * dt);
   G.pos += G.speed * dt;
 
+  // record the run for the ghost replay (10 samples/s)
+  while (G.trace.length < Math.floor(G.raceT * 10) && G.trace.length < 400) {
+    G.trace.push(Math.round(G.pos * 10) / 10);
+  }
+
   if (!G.finished && G.pos >= QUARTER_MILE) {
     G.finished = true;
     G.et = G.raceT;
     G.trap = G.speed * 3.6;
+    buzz([40, 60, 40]);
     if (!G.best[G.carId] || G.et < G.best[G.carId]) {
       G.best[G.carId] = G.et;
       G.newBest = true;
+      G.ghosts[G.carId] = G.trace.slice();
       save();
     }
   }
@@ -1155,6 +1189,19 @@ function drawRaceView() {
   if (aiX > -60 && aiX < W + 60) {
     drawCarSprite(G.oppCar, aiX - 16, AI_BOTTOM - oppH, RIVAL_PAL, G.wheelFrame * 0.9, 1);
   }
+  // ghost of your best run (player lane, translucent)
+  const ghost = G.ghosts[G.carId];
+  if (ghost && ghost.length > 1 && G.screen === 'race') {
+    const gi = Math.min(G.raceT * 10, ghost.length - 1);
+    const i0 = Math.floor(gi);
+    const gp = ghost[i0] + (ghost[Math.min(i0 + 1, ghost.length - 1)] - ghost[i0]) * (gi - i0);
+    const gx = PLAYER_SCREEN + (gp - G.pos) * PX_PER_M;
+    if (gx > -60 && gx < W + 60) {
+      ctx.globalAlpha = 0.3;
+      drawCarSprite(S.car, gx - 16, PLAYER_BOTTOM - carHeight(S.car), S.car.pal, G.wheelFrame, 1);
+      ctx.globalAlpha = 1;
+    }
+  }
   // player car (lower lane)
   const myCar = S.car;
   const myH = carHeight(myCar);
@@ -1268,6 +1315,13 @@ function drawTacho(cx, cy, r) {
   ctx.beginPath();
   ctx.arc(cx, cy, r - 6, rpmToAngle(S.redline), rpmToAngle(S.maxRpm));
   ctx.stroke();
+  // launch sweet spot (staging only): green arc
+  if (G.screen === 'staging') {
+    ctx.strokeStyle = PAL.green;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r - 6, rpmToAngle(S.launchLo), rpmToAngle(S.launchHi));
+    ctx.stroke();
+  }
   ctx.lineWidth = 1;
 
   const maxK = S.maxRpm / 1000;
@@ -1283,8 +1337,11 @@ function drawTacho(cx, cy, r) {
     pixText(String(k), cx + c1 * (r - 19) - 2, cy + s1 * (r - 19) - 4, 8);
   }
 
-  const inWindow = G.rpm >= S.perfectLo;
-  const blink = Math.floor(G.time * 10) % 2 === 0;
+  // shift light: launch window while staging, shift window in the race
+  const inWindow = G.screen === 'staging'
+    ? G.rpm >= S.launchLo && G.rpm <= S.launchHi
+    : G.rpm >= S.perfectLo;
+  const blink = G.screen === 'staging' || Math.floor(G.time * 10) % 2 === 0;
   ctx.fillStyle = inWindow && blink ? PAL.green : '#1e2e1e';
   ctx.fillRect(cx - 5, cy - r + 13, 10, 6);
 
@@ -1399,8 +1456,15 @@ function drawMenu() {
   pixTextCenter(best ? 'BEST ' + best.toFixed(2) + 's' : 'NO TIME SET', 154, 8, 345);
   pixTextCenter(Math.round(S.peakTorque) + 'NM · ' + Math.round(S.mass) + 'KG', 168, 8, 345);
 
+  // sound toggle
+  const sx = 380, sy = 232, sw = 86, sh = 18;
+  panel(sx, sy, sw, sh);
+  ctx.fillStyle = G.muted ? PAL.dim : PAL.green;
+  pixTextCenter(G.muted ? 'SOUND OFF' : 'SOUND ON', sy + 5, 8, sx + sw / 2);
+  hits.push({ x: sx, y: sy, w: sw, h: sh, action: 'togglesound' });
+
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('3DAGI · v0.4 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
+  pixTextCenter('3DAGI · v0.5 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
   drawHUDFlash();
 }
 
