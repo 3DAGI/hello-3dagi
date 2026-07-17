@@ -4,8 +4,11 @@ A simple **pixel-art drag racing game for mobile** (landscape) — tachometer, m
 gearbox, christmas-tree start, quarter-mile races against AI opponents, and a garage
 full of upgrades.
 
-- **Gameplay**: rev at the tree, launch in the sweet spot, shift at redline. Perfect
-  launches and perfect shifts win races. Best times saved per car.
+- **Gameplay**: burnout to heat your tires, rev at the tree, launch in the sweet spot,
+  shift at redline. Perfect launches, hot tires and perfect shifts win races; reaction
+  time and photo-finish slow-mo included. 1/8, 1/4 and 1/2 mile distances.
+- **Tuning & style**: dyno tune (final drive + NOS mix) and a paint shop per car;
+  three race environments (night city, sunset mesa, docklands).
 - **Career mode**: 19 rivals that get faster and faster (18.5s down to 9.2s), with a
   boss fight every 5 stages. Quick Race (STREET / PRO / BOSS) stays open for grinding.
 - **5 cars**: from the HATCH 86 starter to the TOP FUEL X dragster — each with its own
