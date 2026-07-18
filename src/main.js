@@ -18,6 +18,7 @@ import {
   DUEL_STAKES, FUEL_DECIMALS, CAR_PRICES_FUEL, CAR_MODELS,
   PACK_PRICES_FUEL, BOSS_REWARDS_FUEL,
 } from './chain.js';
+import { fetchPrices, prices, pricesFresh, rateDriftBps, fuelToUsd } from './prices.js';
 import { sendIxs } from './solana.js';
 import { PublicKey } from '@solana/web3.js';
 
@@ -927,6 +928,8 @@ async function refreshChain(force) {
   G.chainMsg = '';
   try {
     if (force || !G.chainCfg) G.chainCfg = await getConfig();
+    // live market quotes (TTL-cached, independent of the program)
+    fetchPrices(G.chainCfg ? G.chainCfg.skrMint.toBase58() : null);
     if (!G.chainCfg) { G.chainMsg = 'PROGRAM NOT LIVE YET'; return; }
     if (G.chainTab === 'board' || force) {
       G.board = await getBoard(G.chainCfg.season);
@@ -1118,6 +1121,9 @@ function gotoScreen(name) {
   G.time = 0;
   controls.classList.add('hidden');
   if (name === 'wallet' || name === 'ranked') refreshChain();
+  if (name === 'shop' || name === 'dealer') {
+    fetchPrices(G.chainCfg ? G.chainCfg.skrMint.toBase58() : null);
+  }
 }
 
 // ============================================================
@@ -2652,9 +2658,10 @@ function drawDealer() {
       ctx.fillStyle = live ? PAL.nos : PAL.dim;
       pixTextCenter('MINT NFT', ny + 8, 9, nx + nw / 2);
       ctx.fillStyle = PAL.dim;
-      pixTextCenter(live
+      const usd = pricesFresh() ? ' ≈$' + fuelToUsd(CAR_PRICES_FUEL[G.dealerIdx], G.chainCfg).toFixed(2) : '';
+      pixTextCenter((live
         ? fmtPrice(G.chainCfg, CAR_PRICES_FUEL[G.dealerIdx], G.payCur)
-        : CAR_PRICES_FUEL[G.dealerIdx] + ' FUEL', ny + 22, 7, nx + nw / 2);
+        : CAR_PRICES_FUEL[G.dealerIdx] + ' FUEL') + usd, ny + 22, 6, nx + nw / 2);
       if (live) hits.push({ x: nx, y: ny, w: nw, h: nh, action: 'mintnft' });
       // payment currency toggle (SKR pays less — ecosystem discount)
       chainButton(nx + nw + 8, ny + 8, 62, 24, CUR_NAMES[G.payCur] + ' >', PAL.cash, 'paycur');
@@ -2778,6 +2785,23 @@ function drawChainWallet() {
   const pendSkr = p ? p.claimableSkr / 1e6 : 0;
   pixText('SOL ' + G.solBal.toFixed(3) + (pendSol > 0 ? ' (+' + pendSol.toFixed(3) + ')' : '') +
     ' · SKR ' + G.skrBal.toFixed(1) + (pendSkr > 0 ? ' (+' + pendSkr.toFixed(1) + ')' : ''), 24, 142, 8);
+
+  // live market feed + on-chain rate drift warning
+  if (pricesFresh()) {
+    const age = Math.round((Date.now() - prices.ts) / 60000);
+    ctx.fillStyle = '#8ce8e0';
+    pixText('LIVE: SOL $' + prices.solUsd.toFixed(2) +
+      (prices.skrUsd > 0 ? ' · SKR $' + prices.skrUsd.toFixed(4) : '') +
+      (age > 0 ? ' · ' + age + 'M AGO' : ''), 24, 156, 7);
+    const drift = rateDriftBps(G.chainCfg);
+    if (drift !== null && drift > 1000) {
+      ctx.fillStyle = PAL.amber;
+      pixText('ON-CHAIN RATES ' + (drift / 100).toFixed(0) + '% OFF MARKET - KEEPER SHOULD RUN', 24, 168, 7);
+    }
+  } else if (prices.error) {
+    ctx.fillStyle = PAL.dim;
+    pixText('PRICE FEED: ' + prices.error, 24, 156, 7);
+  }
   if (claimable > 0 || pendSol > 0 || pendSkr > 0) {
     chainButton(280, 96, 186, 30, sol.busy ? 'SIGNING...' : 'CLAIM ALL', PAL.cash, 'claimfuel');
   }

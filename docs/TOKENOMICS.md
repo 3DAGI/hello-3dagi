@@ -114,9 +114,15 @@ A separate tradeable "NOS token" was considered and rejected:
 | `skr_discount_bps` | 1,000 | 10% cheaper in SKR |
 | `season_duration` | 14 days | prize cadence |
 
-Rates are the one knob that needs care at mainnet: set them from market
-prices at launch and adjust via `set_rates` (or wire a Pyth/Switchboard
-oracle in v3). On devnet, any SPL mint can stand in for SKR.
+Rates are kept fresh automatically: `src/prices.js` feeds the client live
+SOL/SKR quotes (Jupiter price API v3 by mint, CoinGecko fallback, 60s TTL,
+stale-while-error) for price display, USD equivalents and an in-game drift
+warning; `scripts/update-rates.mjs` is the keeper that derives target rates
+from the FUEL peg and calls `set_rates` whenever drift exceeds 5% — run it
+manually, via cron, or through the `update-rates` GitHub workflow (every 6h,
+enabled by the `RATES_KEEPER_ENABLED` repo variable + admin secrets). A
+Pyth/Switchboard oracle remains the trust-minimized v3 upgrade. On devnet,
+any SPL mint can stand in for SKR.
 
 ## Fairness / trust model
 

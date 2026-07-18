@@ -1,0 +1,33 @@
+name: Update exchange rates
+
+# Keeps the program's SOL/SKR exchange rates in sync with the market.
+# Needs two repo secrets:
+#   ADMIN_KEYPAIR_JSON - the admin keypair as a JSON byte array
+#   RPC_URL            - the RPC endpoint (devnet or mainnet)
+# Does nothing (skips) until those secrets exist.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *' # every 6 hours
+  workflow_dispatch:
+
+jobs:
+  update-rates:
+    runs-on: ubuntu-latest
+    if: ${{ vars.RATES_KEEPER_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Write admin keypair
+        run: echo "$ADMIN_KEYPAIR_JSON" > /tmp/admin.json
+        env:
+          ADMIN_KEYPAIR_JSON: ${{ secrets.ADMIN_KEYPAIR_JSON }}
+      - name: Update rates when drifted
+        run: node scripts/update-rates.mjs --threshold-bps 500
+        env:
+          ADMIN_KEYPAIR: /tmp/admin.json
+          RPC_URL: ${{ secrets.RPC_URL }}
