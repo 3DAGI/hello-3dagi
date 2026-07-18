@@ -26,6 +26,16 @@ needs the Solana + Anchor toolchain.
 - `claim()` — mints `claimable` FUEL to the caller's ATA
 - `create_duel(seed, stake)` / `join_duel()` / `submit_duel_time(et_ms)` /
   `settle_duel()` / `cancel_duel()` — PvP flow, 3% rake burned
+- `queue_join(stake)` / `queue_match(slot)` / `queue_leave()` /
+  `submit_ranked_time(et_ms)` / `settle_ranked()` — the real on-chain ranked
+  queue: a global 8-slot PDA (`["queue"]`) holds waiting players with their RP
+  and escrowed stake; joining players first try to `queue_match` a waiting
+  rival inside the rating band (±150 RP, widening +50/min of waiting — this is
+  enforced by the program, not the client), which creates a `RankedMatch` PDA,
+  escrows both stakes and links both `Player.active_match` pointers so the
+  waiting player finds the match on their next sync. Both race solo, submit,
+  and `settle_ranked` pays the pot minus burned 3% rake and applies an integer
+  Elo swing (8–40 RP, upsets pay more) to both on-chain profiles.
 - `mint_car(model)` — burns the FUEL price and mints the car as a Metaplex NFT
   (metadata + master edition, 5% royalty) to the buyer; mints are enumerable via
   `config.cars_minted` and PDA seeds `["carmint", model, index]`, so the client

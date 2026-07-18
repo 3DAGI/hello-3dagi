@@ -59,4 +59,29 @@ describe("pixel-drag-racer", () => {
     const bal = await provider.connection.getTokenAccountBalance(ata);
     if (bal.value.amount !== "10000000") throw new Error("claim failed");
   });
+
+  it("joins and leaves the ranked queue", async () => {
+    const queue = PublicKey.findProgramAddressSync(
+      [Buffer.from("queue")], program.programId)[0];
+    const qvault = PublicKey.findProgramAddressSync(
+      [Buffer.from("qvault")], program.programId)[0];
+    const ata = getAssociatedTokenAddressSync(mint, me);
+
+    await program.methods
+      .queueJoin(new BN(1_000_000)) // 1 FUEL
+      .accounts({
+        authority: me, config, mint, player: player(me),
+        queue, qvault, authorityAta: ata,
+      })
+      .rpc();
+    let q: any = await program.account.rankedQueue.fetch(queue);
+    if (!q.slots.some((s: any) => s.player.equals(me))) throw new Error("not queued");
+
+    await program.methods
+      .queueLeave()
+      .accounts({ authority: me, queue, qvault, authorityAta: ata })
+      .rpc();
+    q = await program.account.rankedQueue.fetch(queue);
+    if (q.slots.some((s: any) => s.player.equals(me))) throw new Error("still queued");
+  });
 });

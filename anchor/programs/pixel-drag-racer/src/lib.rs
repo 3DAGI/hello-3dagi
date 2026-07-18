@@ -35,6 +35,13 @@ pub const RANK_MULT: [u64; BOARD_SIZE] = [
     500, 300, 200, 100, 100, 100, 100, 100, 50, 50, 50, 50, 50, 50, 50, 50,
 ];
 
+// Ranked on-chain queue
+pub const QUEUE_SIZE: usize = 8;
+pub const RANKED_START_RP: u16 = 300;
+pub const BASE_BAND: i64 = 150;        // matchable RP distance at t=0
+pub const BAND_PER_MIN: i64 = 50;      // band widens while waiting
+pub const MATCH_TIMEOUT: i64 = 3_600;
+
 // Car NFTs: models, mint prices in whole FUEL (burned = deflationary sink)
 pub const CAR_MODELS: usize = 5;
 pub const CAR_PRICES_FUEL: [u64; CAR_MODELS] = [2_000, 6_500, 18_000, 42_000, 110_000];
@@ -91,6 +98,8 @@ pub mod pixel_drag_racer {
         player.claimable = 0;
         player.referral_count = 0;
         player.referral_earned = 0;
+        player.rp = RANKED_START_RP;
+        player.active_match = Pubkey::default();
         player.bump = ctx.bumps.player;
 
         // count the referral on the referrer's profile (if provided)
@@ -376,6 +385,265 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
+    /// Ranked queue: wait for a rival. Your stake is escrowed in the
+    /// queue vault until someone matches you (or you leave).
+    pub fn queue_join(ctx: Context<QueueJoin>, stake: u64) -> Result<()> {
+        require!(stake > 0, PdrError::BadParams);
+        let player = &ctx.accounts.player;
+        require!(player.active_match == Pubkey::default(), PdrError::InMatch);
+
+        let queue = &mut ctx.accounts.queue;
+        if queue.bump == 0 {
+            queue.bump = ctx.bumps.queue;
+        }
+        let me = ctx.accounts.authority.key();
+        require!(
+            queue.slots.iter().all(|s| s.player != me),
+            PdrError::AlreadyQueued
+        );
+        let slot = queue
+            .slots
+            .iter_mut()
+            .find(|s| s.player == Pubkey::default())
+            .ok_or(PdrError::QueueFull)?;
+        *slot = QueueSlot {
+            player: me,
+            rp: player.rp,
+            stake,
+            ts: Clock::get()?.unix_timestamp,
+        };
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.authority_ata.to_account_info(),
+                    to: ctx.accounts.qvault.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+            ),
+            stake,
+        )?;
+        Ok(())
+    }
+
+    /// Ranked queue: match with the waiting player in `slot_index`.
+    /// Only allowed inside the RP band (which widens while they wait);
+    /// creates the match, escrows both stakes, links both profiles.
+    pub fn queue_match(ctx: Context<QueueMatch>, slot_index: u8) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let me = ctx.accounts.authority.key();
+        let slot = {
+            let queue = &ctx.accounts.queue;
+            *queue
+                .slots
+                .get(slot_index as usize)
+                .ok_or(PdrError::BadParams)?
+        };
+        require!(slot.player != Pubkey::default(), PdrError::SlotEmpty);
+        require!(slot.player != me, PdrError::SelfDuel);
+        require!(
+            ctx.accounts.opp_player.wallet == slot.player,
+            PdrError::RankAccountMismatch
+        );
+        require!(
+            ctx.accounts.player.active_match == Pubkey::default()
+                && ctx.accounts.opp_player.active_match == Pubkey::default(),
+            PdrError::InMatch
+        );
+
+        // rating band check, widening with wait time
+        let band = BASE_BAND + ((now - slot.ts).max(0) / 60) * BAND_PER_MIN;
+        let diff = (ctx.accounts.player.rp as i64 - slot.rp as i64).abs();
+        require!(diff <= band, PdrError::OutOfBand);
+
+        // my stake in
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.authority_ata.to_account_info(),
+                    to: ctx.accounts.mvault.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+            ),
+            slot.stake,
+        )?;
+        // their escrowed stake moves from the queue vault
+        let qbump = ctx.accounts.queue.bump;
+        let qseeds: &[&[u8]] = &[b"queue", &[qbump]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.qvault.to_account_info(),
+                    to: ctx.accounts.mvault.to_account_info(),
+                    authority: ctx.accounts.queue.to_account_info(),
+                },
+                &[qseeds],
+            ),
+            slot.stake,
+        )?;
+
+        let m = &mut ctx.accounts.ranked_match;
+        m.a = slot.player;
+        m.b = me;
+        m.stake = slot.stake;
+        m.a_et_ms = 0;
+        m.b_et_ms = 0;
+        m.deadline = now + MATCH_TIMEOUT;
+        m.settled = false;
+        m.bump = ctx.bumps.ranked_match;
+
+        let mkey = m.key();
+        ctx.accounts.player.active_match = mkey;
+        ctx.accounts.opp_player.active_match = mkey;
+
+        let queue = &mut ctx.accounts.queue;
+        queue.slots[slot_index as usize] = QueueSlot::default();
+        Ok(())
+    }
+
+    /// Leave the queue and reclaim the escrowed stake.
+    pub fn queue_leave(ctx: Context<QueueLeave>) -> Result<()> {
+        let me = ctx.accounts.authority.key();
+        let (idx, stake) = {
+            let queue = &ctx.accounts.queue;
+            let idx = queue
+                .slots
+                .iter()
+                .position(|s| s.player == me)
+                .ok_or(PdrError::NotQueued)?;
+            (idx, queue.slots[idx].stake)
+        };
+        let qbump = ctx.accounts.queue.bump;
+        let qseeds: &[&[u8]] = &[b"queue", &[qbump]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.qvault.to_account_info(),
+                    to: ctx.accounts.authority_ata.to_account_info(),
+                    authority: ctx.accounts.queue.to_account_info(),
+                },
+                &[qseeds],
+            ),
+            stake,
+        )?;
+        ctx.accounts.queue.slots[idx] = QueueSlot::default();
+        Ok(())
+    }
+
+    /// Each matched player submits their solo run once.
+    pub fn submit_ranked_time(ctx: Context<SubmitRankedTime>, et_ms: u32) -> Result<()> {
+        require!((MIN_ET_MS..=MAX_ET_MS).contains(&et_ms), PdrError::ImplausibleTime);
+        let m = &mut ctx.accounts.ranked_match;
+        require!(!m.settled, PdrError::DuelSettled);
+        let who = ctx.accounts.authority.key();
+        if who == m.a {
+            require!(m.a_et_ms == 0, PdrError::AlreadySubmitted);
+            m.a_et_ms = et_ms;
+        } else if who == m.b {
+            require!(m.b_et_ms == 0, PdrError::AlreadySubmitted);
+            m.b_et_ms = et_ms;
+        } else {
+            return err!(PdrError::NotInDuel);
+        }
+        Ok(())
+    }
+
+    /// Settle a ranked match: pot minus burned rake to the winner and
+    /// an on-chain Elo swing between both player profiles.
+    pub fn settle_ranked(ctx: Context<SettleRanked>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let m = &ctx.accounts.ranked_match;
+        require!(!m.settled, PdrError::DuelSettled);
+        let both = m.a_et_ms != 0 && m.b_et_ms != 0;
+        require!(both || now > m.deadline, PdrError::DuelRunning);
+        require!(
+            ctx.accounts.player_a.wallet == m.a && ctx.accounts.player_b.wallet == m.b,
+            PdrError::RankAccountMismatch
+        );
+
+        let a = if m.a_et_ms == 0 { u32::MAX } else { m.a_et_ms };
+        let b = if m.b_et_ms == 0 { u32::MAX } else { m.b_et_ms };
+        let pot = ctx.accounts.mvault.amount;
+        let seeds: &[&[u8]] = &[
+            b"match",
+            m.a.as_ref(),
+            m.b.as_ref(),
+            &[m.bump],
+        ];
+
+        if a == b {
+            // tie / double no-show: refund, no rating change
+            let half = pot / 2;
+            for (ata, amt) in [
+                (&ctx.accounts.a_ata, half),
+                (&ctx.accounts.b_ata, pot - half),
+            ] {
+                token::transfer(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Transfer {
+                            from: ctx.accounts.mvault.to_account_info(),
+                            to: ata.to_account_info(),
+                            authority: ctx.accounts.ranked_match.to_account_info(),
+                        },
+                        &[seeds],
+                    ),
+                    amt,
+                )?;
+            }
+        } else {
+            let a_wins = a < b;
+            let rake = pot * RAKE_BPS / 10_000;
+            let winnings = pot - rake;
+            let winner_ata = if a_wins { &ctx.accounts.a_ata } else { &ctx.accounts.b_ata };
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.mvault.to_account_info(),
+                        to: winner_ata.to_account_info(),
+                        authority: ctx.accounts.ranked_match.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                winnings,
+            )?;
+            if rake > 0 {
+                token::burn(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Burn {
+                            mint: ctx.accounts.mint.to_account_info(),
+                            from: ctx.accounts.mvault.to_account_info(),
+                            authority: ctx.accounts.ranked_match.to_account_info(),
+                        },
+                        &[seeds],
+                    ),
+                    rake,
+                )?;
+            }
+            // integer Elo: upsets pay more, capped swing
+            let (winner, loser) = if a_wins {
+                (&mut ctx.accounts.player_a, &mut ctx.accounts.player_b)
+            } else {
+                (&mut ctx.accounts.player_b, &mut ctx.accounts.player_a)
+            };
+            let diff = loser.rp as i64 - winner.rp as i64;
+            let delta = (20 + diff / 10).clamp(8, 40) as u16;
+            winner.rp = winner.rp.saturating_add(delta);
+            loser.rp = loser.rp.saturating_sub(delta);
+        }
+
+        ctx.accounts.player_a.active_match = Pubkey::default();
+        ctx.accounts.player_b.active_match = Pubkey::default();
+        ctx.accounts.ranked_match.settled = true;
+        Ok(())
+    }
+
     /// Mints a car as a tradeable Metaplex NFT. The FUEL price is
     /// burned (deflationary sink); the NFT itself trades freely on any
     /// marketplace and unlocks the car model in-game for its holder.
@@ -557,10 +825,47 @@ pub struct Player {
     pub claimable: u64,
     pub referral_count: u32,
     pub referral_earned: u64,
+    pub rp: u16,
+    pub active_match: Pubkey,
     pub bump: u8,
 }
 impl Player {
-    pub const SIZE: usize = 8 + 32 + 33 + 2 + 4 + 4 + 8 + 4 + 8 + 1;
+    pub const SIZE: usize = 8 + 32 + 33 + 2 + 4 + 4 + 8 + 4 + 8 + 2 + 32 + 1;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq)]
+pub struct QueueSlot {
+    pub player: Pubkey,
+    pub rp: u16,
+    pub stake: u64,
+    pub ts: i64,
+}
+impl QueueSlot {
+    pub const SIZE: usize = 32 + 2 + 8 + 8;
+}
+
+#[account]
+pub struct RankedQueue {
+    pub slots: [QueueSlot; QUEUE_SIZE],
+    pub bump: u8,
+}
+impl RankedQueue {
+    pub const SIZE: usize = 8 + QueueSlot::SIZE * QUEUE_SIZE + 1;
+}
+
+#[account]
+pub struct RankedMatch {
+    pub a: Pubkey,
+    pub b: Pubkey,
+    pub stake: u64,
+    pub a_et_ms: u32,
+    pub b_et_ms: u32,
+    pub deadline: i64,
+    pub settled: bool,
+    pub bump: u8,
+}
+impl RankedMatch {
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 4 + 4 + 8 + 1 + 1;
 }
 
 #[account]
@@ -727,6 +1032,133 @@ pub struct CreateDuel<'info> {
 }
 
 #[derive(Accounts)]
+pub struct QueueJoin<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(address = config.mint)]
+    pub mint: Account<'info, Mint>,
+    #[account(
+        seeds = [b"player", authority.key().as_ref()],
+        bump = player.bump
+    )]
+    pub player: Account<'info, Player>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = RankedQueue::SIZE,
+        seeds = [b"queue"],
+        bump
+    )]
+    pub queue: Account<'info, RankedQueue>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        token::mint = mint,
+        token::authority = queue,
+        seeds = [b"qvault"],
+        bump
+    )]
+    pub qvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = authority_ata.owner == authority.key() @ PdrError::WrongAta)]
+    pub authority_ata: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct QueueMatch<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(address = config.mint)]
+    pub mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        seeds = [b"player", authority.key().as_ref()],
+        bump = player.bump
+    )]
+    pub player: Account<'info, Player>,
+    #[account(mut)]
+    pub opp_player: Account<'info, Player>,
+    #[account(mut, seeds = [b"queue"], bump = queue.bump)]
+    pub queue: Account<'info, RankedQueue>,
+    #[account(mut, seeds = [b"qvault"], bump)]
+    pub qvault: Account<'info, TokenAccount>,
+    #[account(
+        init,
+        payer = authority,
+        space = RankedMatch::SIZE,
+        seeds = [b"match", opp_player.wallet.as_ref(), authority.key().as_ref()],
+        bump
+    )]
+    pub ranked_match: Account<'info, RankedMatch>,
+    #[account(
+        init,
+        payer = authority,
+        token::mint = mint,
+        token::authority = ranked_match,
+        seeds = [b"mvault", ranked_match.key().as_ref()],
+        bump
+    )]
+    pub mvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = authority_ata.owner == authority.key() @ PdrError::WrongAta)]
+    pub authority_ata: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct QueueLeave<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(mut, seeds = [b"queue"], bump = queue.bump)]
+    pub queue: Account<'info, RankedQueue>,
+    #[account(mut, seeds = [b"qvault"], bump)]
+    pub qvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = authority_ata.owner == authority.key() @ PdrError::WrongAta)]
+    pub authority_ata: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SubmitRankedTime<'info> {
+    pub authority: Signer<'info>,
+    #[account(mut)]
+    pub ranked_match: Account<'info, RankedMatch>,
+}
+
+#[derive(Accounts)]
+pub struct SettleRanked<'info> {
+    pub payer: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, address = config.mint)]
+    pub mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        seeds = [b"match", ranked_match.a.as_ref(), ranked_match.b.as_ref()],
+        bump = ranked_match.bump
+    )]
+    pub ranked_match: Account<'info, RankedMatch>,
+    #[account(mut, seeds = [b"mvault", ranked_match.key().as_ref()], bump)]
+    pub mvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = a_ata.owner == ranked_match.a @ PdrError::WrongAta)]
+    pub a_ata: Account<'info, TokenAccount>,
+    #[account(mut, constraint = b_ata.owner == ranked_match.b @ PdrError::WrongAta)]
+    pub b_ata: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub player_a: Account<'info, Player>,
+    #[account(mut)]
+    pub player_b: Account<'info, Player>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
 #[instruction(model: u8)]
 pub struct MintCar<'info> {
     #[account(mut)]
@@ -870,4 +1302,16 @@ pub enum PdrError {
     DuelNotJoined,
     #[msg("wrong token account")]
     WrongAta,
+    #[msg("ranked queue is full")]
+    QueueFull,
+    #[msg("already waiting in the queue")]
+    AlreadyQueued,
+    #[msg("you are not in the queue")]
+    NotQueued,
+    #[msg("queue slot is empty")]
+    SlotEmpty,
+    #[msg("outside the rating band")]
+    OutOfBand,
+    #[msg("finish your active match first")]
+    InMatch,
 }

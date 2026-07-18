@@ -10,6 +10,8 @@ import {
   submitTimeOnChain, claimFuel, registerWithReferrer,
   createDuelIx, joinDuelIx, submitDuelTimeIx, settleDuelIx, cancelDuelIx,
   mintCarNft, getOwnedCarModels,
+  getQueue, getMatch, enterRankedQueue, leaveRankedQueue,
+  submitRankedTimeIx, settleRankedIx, RANKED_STAKE,
   DUEL_STAKES, FUEL_DECIMALS, CAR_PRICES_FUEL,
 } from './chain.js';
 import { sendIxs } from './solana.js';
@@ -314,6 +316,8 @@ const G = {
   paint: {},             // paint index per car (persisted)
   tune: {},              // {carId: {fd, nos}} dyno setup (persisted)
   nftModels: [],         // car models this wallet holds as NFTs
+  chainQueue: null,      // ranked queue slots
+  chainMatch: null,      // my active on-chain ranked match
   // ranked mode (persisted)
   rp: 0, rankedW: 0, rankedL: 0, rankedMonth: '',
   rankedOpp: null,       // matched opponent {name, et, rp, car}
@@ -583,10 +587,11 @@ function tapAnywhere(x, y, isKey) {
     const h = hitAt(x, y);
     if (h && h.action === 'postrecord') { postRaceRecord(); return; }
     if (h && h.action === 'duelsubmit') { doDuelSubmit(); return; }
+    if (h && h.action === 'chainsubmit') { doChainSubmitRanked(); return; }
     if (G.time > 0.6) {
       if (G.mode === 'career') gotoScreen('career');
       else if (G.mode === 'duel') { gotoScreen('wallet'); G.chainTab = 'duel'; refreshChain(); }
-      else if (G.mode === 'ranked') gotoScreen('ranked');
+      else if (G.mode === 'ranked' || G.mode === 'chainrank') gotoScreen('ranked');
       else gotoScreen('menu');
     }
     return;
@@ -640,7 +645,63 @@ function tapAnywhere(x, y, isKey) {
       break;
     case 'rankedrace': startRankedRace(); break;
     case 'mintnft': doMintCarNft(); break;
+    case 'chainqueue': doChainQueue(); break;
+    case 'chainleave': doChainLeave(); break;
+    case 'chainrace': startChainRankedRace(); break;
+    case 'chainsettle': doChainSettle(); break;
   }
+}
+
+// ------------------------------------------------------------
+// On-chain ranked queue actions
+// ------------------------------------------------------------
+async function doChainQueue() {
+  if (sol.busy) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) { setFlash(sol.error, PAL.red); return; } }
+  setFlash('CHECKING THE QUEUE...', PAL.nos);
+  const res = await enterRankedQueue();
+  if (!res.sig) { setFlash(sol.error, PAL.red); return; }
+  setFlash(res.matched ? 'MATCHED! RACE YOUR RIVAL!' : 'IN QUEUE - WAITING FOR A RIVAL', PAL.green);
+  refreshChain(true);
+}
+
+async function doChainLeave() {
+  if (sol.busy) return;
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await leaveRankedQueue();
+  setFlash(sig ? 'LEFT THE QUEUE - STAKE BACK' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+function startChainRankedRace() {
+  if (!G.chainMatch || G.chainMatch.settled) return;
+  G.mode = 'chainrank';
+  G.distanceM = QUARTER_MILE;
+  G.aiEt = 9999;
+  const me = sol.address;
+  const rival = G.chainMatch.a.toBase58() === me ? G.chainMatch.b : G.chainMatch.a;
+  G.oppName = rival.toBase58().slice(0, 4) + '..' + rival.toBase58().slice(-4);
+  G.oppCar = S.car;
+  G.theme = Math.floor(Math.random() * THEMES.length);
+  beginStaging();
+}
+
+async function doChainSubmitRanked() {
+  if (!G.chainMatch || sol.busy) return;
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([
+    submitRankedTimeIx(getPublicKey(), G.chainMatch.address, Math.round(G.et * 1000)),
+  ]);
+  setFlash(sig ? 'RANKED TIME SUBMITTED!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+async function doChainSettle() {
+  if (!G.chainMatch || sol.busy) return;
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([settleRankedIx(getPublicKey(), G.chainMatch)]);
+  setFlash(sig ? 'MATCH SETTLED - GG!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) { G.chainMatch = null; refreshChain(true); }
 }
 
 async function doMintCarNft() {
@@ -678,6 +739,9 @@ async function refreshChain(force) {
     if (me) {
       G.chainPlayer = await getPlayer(me);
       G.fuel = await getFuelBalance(me);
+      G.chainQueue = await getQueue();
+      G.chainMatch = G.chainPlayer && G.chainPlayer.activeMatch
+        ? await getMatch(G.chainPlayer.activeMatch) : null;
       G.nftModels = await getOwnedCarModels(me, G.chainCfg);
       // NFTs held in the wallet unlock their car model in-game
       for (const m of G.nftModels) {
@@ -853,7 +917,7 @@ function gotoScreen(name) {
   G.screen = name;
   G.time = 0;
   controls.classList.add('hidden');
-  if (name === 'wallet') refreshChain();
+  if (name === 'wallet' || name === 'ranked') refreshChain();
 }
 
 // ============================================================
@@ -1039,6 +1103,10 @@ function applyRewards() {
     G.earned = { total: 0, lines: ['DUEL RUN - SUBMIT YOUR TIME ON-CHAIN'] };
     return;
   }
+  if (G.mode === 'chainrank') {
+    G.earned = { total: 0, lines: ['RANKED MATCH - SUBMIT YOUR TIME ON-CHAIN'] };
+    return;
+  }
   if (G.mode === 'ranked') {
     // Elo-style points vs the matched opponent
     const opp = G.rankedOpp || { rp: G.rp };
@@ -1212,7 +1280,7 @@ function updatePlayer(dt) {
 }
 
 function updateAI(dt) {
-  if (G.mode === 'duel') return; // rival races on their own device
+  if (G.mode === 'duel' || G.mode === 'chainrank') return; // rival races on their own device
   const t = G.raceT;
   const p = G.distanceM * Math.pow(Math.min(t, G.aiEt) / G.aiEt, 1.55);
   if (t <= G.aiEt) {
@@ -1800,7 +1868,7 @@ function drawMenu() {
   hits.push({ x: sx, y: sy, w: sw, h: sh, action: 'togglesound' });
 
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('3DAGI · v0.7 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
+  pixTextCenter('3DAGI · v0.8 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
   drawHUDFlash();
 }
 
@@ -1923,8 +1991,45 @@ function drawRanked() {
     pixTextCenter(d.min + '+', by + 18, 7, bx + bw / 2);
   });
 
-  ctx.fillStyle = PAL.dim;
-  pixTextCenter('SEASON RESETS MONTHLY (RP HALVED) · WIN CASH BY DIVISION', 198, 7);
+  // on-chain ladder row (Seeker / Android): real rivals, FUEL stakes,
+  // RP lives on your player profile on Solana
+  if (mwaSupported) {
+    const live = !!G.chainCfg;
+    ctx.fillStyle = PAL.nos;
+    pixText('ON-CHAIN LADDER', 24, 196, 8);
+    const m = G.chainMatch;
+    const me = sol.address;
+    const queued = G.chainQueue && me &&
+      G.chainQueue.slots.some(s => s.player.toBase58() === me);
+    if (!live) {
+      ctx.fillStyle = PAL.dim;
+      pixText('PROGRAM NOT LIVE YET', 150, 196, 8);
+    } else if (m && !m.settled) {
+      const myEt = m.a.toBase58() === me ? m.aEtMs : m.bEtMs;
+      const theirEt = m.a.toBase58() === me ? m.bEtMs : m.aEtMs;
+      ctx.fillStyle = PAL.text;
+      pixText('MATCHED · POT ' + (2 * m.stake / 10 ** FUEL_DECIMALS).toFixed(0) + ' FUEL', 150, 196, 8);
+      if (!myEt) {
+        chainButton(330, 190, 136, 22, 'RACE RIVAL!', PAL.green, 'chainrace');
+      } else if (theirEt || Date.now() / 1000 > m.deadline) {
+        chainButton(330, 190, 136, 22, sol.busy ? 'SIGNING...' : 'SETTLE MATCH', PAL.cash, 'chainsettle');
+      } else {
+        ctx.fillStyle = PAL.amber;
+        pixText('WAITING FOR RIVAL RUN...', 330, 196, 7);
+      }
+    } else if (queued) {
+      ctx.fillStyle = PAL.amber;
+      pixText('IN QUEUE · CHAIN RP ' + (G.chainPlayer ? G.chainPlayer.rp : '-'), 150, 196, 8);
+      chainButton(330, 190, 136, 22, sol.busy ? '...' : 'LEAVE QUEUE', PAL.red, 'chainleave');
+    } else {
+      ctx.fillStyle = PAL.dim;
+      pixText('STAKE ' + RANKED_STAKE + ' FUEL · RP ON-CHAIN', 150, 196, 8);
+      chainButton(330, 190, 136, 22, sol.busy ? '...' : 'JOIN QUEUE', PAL.green, 'chainqueue');
+    }
+  } else {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('SEASON RESETS MONTHLY (RP HALVED) · WIN CASH BY DIVISION', 198, 7);
+  }
 
   backButton();
   drawHUDFlash();
@@ -2595,7 +2700,18 @@ function drawResults() {
   }
 
   // on-chain buttons (Seeker / Android with a Solana wallet)
-  if (mwaSupported && G.mode === 'duel' && G.duel && !G.duel.submitted) {
+  if (mwaSupported && G.mode === 'chainrank' && G.chainMatch && !G.chainMatch.settled) {
+    const me = sol.address;
+    const myEt = G.chainMatch.a.toBase58() === me ? G.chainMatch.aEtMs : G.chainMatch.bEtMs;
+    if (!myEt) {
+      const bx = 150, by = 228, bw = 180, bh = 24;
+      const can = !sol.busy;
+      panel(bx, by, bw, bh, can ? PAL.green : PAL.dim);
+      ctx.fillStyle = can ? PAL.green : PAL.dim;
+      pixTextCenter(sol.busy ? 'SIGNING...' : 'SUBMIT RANKED TIME', by + 8, 9);
+      if (can) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'chainsubmit' });
+    }
+  } else if (mwaSupported && G.mode === 'duel' && G.duel && !G.duel.submitted) {
     const bx = 150, by = 228, bw = 180, bh = 24;
     const can = !sol.busy;
     panel(bx, by, bw, bh, can ? PAL.green : PAL.dim);

@@ -24,6 +24,11 @@ export const CAR_PRICES_FUEL = [2000, 6500, 18000, 42000, 110000]; // whole FUEL
 // sha256("global:<ix>")[0..8] / sha256("account:<name>")[0..8]
 const IX = {
   mintCar: [125, 246, 210, 195, 91, 198, 69, 131],
+  queueJoin: [92, 200, 67, 181, 226, 164, 189, 56],
+  queueMatch: [251, 238, 110, 237, 158, 151, 221, 12],
+  queueLeave: [52, 192, 93, 86, 59, 56, 237, 42],
+  submitRankedTime: [223, 56, 168, 66, 18, 176, 96, 194],
+  settleRanked: [78, 68, 211, 230, 47, 191, 182, 178],
   register: [211, 124, 67, 15, 211, 194, 178, 240],
   submitTime: [31, 215, 161, 190, 201, 5, 137, 131],
   claim: [62, 198, 214, 193, 213, 159, 108, 210],
@@ -46,6 +51,10 @@ function pda(seeds) {
 export const configPda = () => pda([enc.encode('config')]);
 export const fuelMintPda = () => pda([enc.encode('fuel')]);
 export const carMintPda = (model, index) => pda([enc.encode('carmint'), new Uint8Array([model]), u32le(index)]);
+export const queuePda = () => pda([enc.encode('queue')]);
+export const qvaultPda = () => pda([enc.encode('qvault')]);
+export const matchPda = (a, b) => pda([enc.encode('match'), a.toBytes(), b.toBytes()]);
+export const mvaultPda = (m) => pda([enc.encode('mvault'), m.toBytes()]);
 export const boardPda = (season) => pda([enc.encode('season'), u16le(season)]);
 export const playerPda = (wallet) => pda([enc.encode('player'), wallet.toBytes()]);
 export const duelPda = (creator, seed) => pda([enc.encode('duel'), creator.toBytes(), u32le(seed)]);
@@ -135,7 +144,7 @@ export async function getPlayer(wallet) {
   if (!data) return null;
   const r = new Reader(data);
   r.skip(8);
-  return {
+  const p = {
     wallet: r.pubkey(),
     referrer: r.option(Reader.prototype.pubkey),
     season: r.u16(),
@@ -144,6 +153,43 @@ export async function getPlayer(wallet) {
     claimable: r.u64(),
     referralCount: r.u32(),
     referralEarned: r.u64(),
+    rp: r.u16(),
+    activeMatch: r.pubkey(),
+  };
+  if (p.activeMatch.equals(PublicKey.default)) p.activeMatch = null;
+  return p;
+}
+
+export async function getQueue() {
+  const data = await fetchAccount(queuePda());
+  if (!data) return { slots: [] };
+  const r = new Reader(data);
+  r.skip(8);
+  const slots = [];
+  for (let i = 0; i < 8; i++) {
+    const player = r.pubkey();
+    const rp = r.u16();
+    const stake = r.u64();
+    const ts = r.i64();
+    if (!player.equals(PublicKey.default)) slots.push({ index: i, player, rp, stake, ts });
+  }
+  return { slots };
+}
+
+export async function getMatch(address) {
+  const data = await fetchAccount(address);
+  if (!data) return null;
+  const r = new Reader(data);
+  r.skip(8);
+  return {
+    address,
+    a: r.pubkey(),
+    b: r.pubkey(),
+    stake: r.u64(),
+    aEtMs: r.u32(),
+    bEtMs: r.u32(),
+    deadline: r.i64(),
+    settled: !!r.u8(),
   };
 }
 
@@ -368,6 +414,114 @@ export async function claimFuel() {
   const me = getPublicKey();
   if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
   return await sendIxs([claimIx(me)]);
+}
+
+// ------------------------------------------------------------
+// Ranked queue instruction builders + flows
+// ------------------------------------------------------------
+export const RANKED_STAKE = 50; // whole FUEL
+
+function queueJoinIx(authority, stakeFuel) {
+  const fuel = fuelMintPda();
+  const stake = BigInt(Math.round(stakeFuel * 10 ** FUEL_DECIMALS));
+  return ix(IX.queueJoin, u64le(stake), [
+    k(authority, true, true),
+    k(configPda()),
+    k(fuel),
+    k(playerPda(authority)),
+    k(queuePda(), true),
+    k(qvaultPda(), true),
+    k(ataFor(authority, fuel), true),
+    k(TOKEN_PROGRAM_ID),
+    k(SystemProgram.programId),
+    k(SYSVAR_RENT_PUBKEY),
+  ]);
+}
+
+function queueMatchIx(authority, slot) {
+  const fuel = fuelMintPda();
+  const m = matchPda(slot.player, authority);
+  return ix(IX.queueMatch, new Uint8Array([slot.index]), [
+    k(authority, true, true),
+    k(configPda()),
+    k(fuel),
+    k(playerPda(authority), true),
+    k(playerPda(slot.player), true),
+    k(queuePda(), true),
+    k(qvaultPda(), true),
+    k(m, true),
+    k(mvaultPda(m), true),
+    k(ataFor(authority, fuel), true),
+    k(TOKEN_PROGRAM_ID),
+    k(SystemProgram.programId),
+    k(SYSVAR_RENT_PUBKEY),
+  ]);
+}
+
+function queueLeaveIx(authority) {
+  return ix(IX.queueLeave, new Uint8Array(0), [
+    k(authority, true, true),
+    k(queuePda(), true),
+    k(qvaultPda(), true),
+    k(ataFor(authority, fuelMintPda()), true),
+    k(TOKEN_PROGRAM_ID),
+  ]);
+}
+
+export function submitRankedTimeIx(authority, matchAddress, etMs) {
+  return ix(IX.submitRankedTime, u32le(etMs), [
+    k(authority, false, true),
+    k(matchAddress, true),
+  ]);
+}
+
+export function settleRankedIx(payer, m) {
+  const fuel = fuelMintPda();
+  return ix(IX.settleRanked, new Uint8Array(0), [
+    k(payer, false, true),
+    k(configPda()),
+    k(fuel, true),
+    k(m.address, true),
+    k(mvaultPda(m.address), true),
+    k(ataFor(m.a, fuel), true),
+    k(ataFor(m.b, fuel), true),
+    k(playerPda(m.a), true),
+    k(playerPda(m.b), true),
+    k(TOKEN_PROGRAM_ID),
+  ]);
+}
+
+// One-button matchmaking: match a waiting rival inside the band if
+// possible, otherwise enqueue. Returns {sig, matched}.
+export async function enterRankedQueue() {
+  const me = getPublicKey();
+  if (!me) { sol.error = 'CONNECT WALLET FIRST'; return { sig: '', matched: false }; }
+  const player = await getPlayer(me);
+  if (!player) { sol.error = 'SUBMIT A TIME FIRST TO REGISTER'; return { sig: '', matched: false }; }
+  if (player.activeMatch) { sol.error = 'FINISH YOUR MATCH FIRST'; return { sig: '', matched: false }; }
+  const queue = await getQueue();
+  const now = Date.now() / 1000;
+  const candidate = queue.slots.find(s => {
+    if (s.player.equals(me)) return false;
+    const band = 150 + Math.max(0, Math.floor((now - s.ts) / 60)) * 50;
+    return Math.abs(player.rp - s.rp) <= band;
+  });
+  if (queue.slots.some(s => s.player.equals(me))) {
+    sol.error = 'ALREADY IN QUEUE';
+    return { sig: '', matched: false };
+  }
+  if (candidate) {
+    const sig = await sendIxs([queueMatchIx(me, candidate)]);
+    return { sig, matched: !!sig };
+  }
+  const sig = await sendIxs([queueJoinIx(me, RANKED_STAKE)]);
+  return { sig, matched: false };
+}
+
+export async function leaveRankedQueue() {
+  const me = getPublicKey();
+  if (!me) return '';
+  return await sendIxs([queueLeaveIx(me)]);
 }
 
 // Mints the given car model as an NFT (price burned in FUEL).

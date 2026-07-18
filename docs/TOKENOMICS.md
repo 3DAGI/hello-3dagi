@@ -23,6 +23,7 @@ players pay their own claim fee, keeping spam low.
 | Sink | Amount |
 |---|---|
 | PvP duel rake | 3% of every pot, burned at settle |
+| Ranked match rake | 3% of every ranked pot (50 FUEL stakes), burned at settle |
 | **Car NFT mints** | 100% of the mint price burned (2,000–110,000 FUEL per model) |
 
 Planned sinks (roadmap): premium car skins for FUEL (100% burn), season entry
