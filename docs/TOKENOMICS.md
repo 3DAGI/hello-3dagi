@@ -23,9 +23,37 @@ players pay their own claim fee, keeping spam low.
 | Sink | Amount |
 |---|---|
 | PvP duel rake | 3% of every pot, burned at settle |
+| **Car NFT mints** | 100% of the mint price burned (2,000–110,000 FUEL per model) |
 
 Planned sinks (roadmap): premium car skins for FUEL (100% burn), season entry
 fees for a pro league, upgrade respec.
+
+## Car NFTs
+
+Every car model can be minted as a real Metaplex NFT (`mint_car`): metadata +
+master edition, 5% secondary royalty, freely tradeable on any marketplace
+(Tensor, Magic Eden, ...). The mint price in FUEL is burned entirely, making
+cars the main deflationary sink. Holding a car NFT in the connected wallet
+unlocks that model in-game — buy in-game with cash for casual play, or mint the
+NFT for true ownership and trading. Mint prices: HATCH 86 2,000 / ROAD KING V8
+6,500 / RX TURBO 18,000 / VIPER GT 42,000 / TOP FUEL X 110,000 FUEL.
+
+## Why NOS is NOT a second token (design decision)
+
+A separate tradeable "NOS token" was considered and rejected for v1:
+
+- **Split liquidity**: two thin markets are worse than one healthy one.
+- **Balance risk**: if a NOS token pumps, a core race mechanic becomes
+  pay-walled for casual players; if it dumps, the sink stops mattering.
+- **Ranked integrity**: consumable power bought on a market inside a ranked
+  ladder is pay-to-win by definition.
+
+Instead, the same economic effect (recurring demand + burn) comes from FUEL
+itself: NOS bottle upgrades and future consumable refills are priced in FUEL
+and burned. If a tradeable NOS asset is ever wanted, the clean design is a
+"NOS CHARGE" SPL token mintable *only* by burning FUEL at a fixed rate —
+effectively wrapped FUEL with utility, which cannot decouple from the main
+economy. The program's burn helpers already support adding this later.
 
 ## PvP staking
 

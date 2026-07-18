@@ -13,13 +13,17 @@ export const PROGRAM_ID = new PublicKey('DmnJq3fTKxCzBAW965MxBGa25H9SmKKgSZ2YVNq
 
 const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+const METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 
 export const FUEL_DECIMALS = 6;
 export const BOARD_SIZE = 16;
 export const DUEL_STAKES = [25, 100, 500]; // whole FUEL
+export const CAR_MODELS = 5;
+export const CAR_PRICES_FUEL = [2000, 6500, 18000, 42000, 110000]; // whole FUEL, burned on mint
 
 // sha256("global:<ix>")[0..8] / sha256("account:<name>")[0..8]
 const IX = {
+  mintCar: [125, 246, 210, 195, 91, 198, 69, 131],
   register: [211, 124, 67, 15, 211, 194, 178, 240],
   submitTime: [31, 215, 161, 190, 201, 5, 137, 131],
   claim: [62, 198, 214, 193, 213, 159, 108, 210],
@@ -41,6 +45,7 @@ function pda(seeds) {
 
 export const configPda = () => pda([enc.encode('config')]);
 export const fuelMintPda = () => pda([enc.encode('fuel')]);
+export const carMintPda = (model, index) => pda([enc.encode('carmint'), new Uint8Array([model]), u32le(index)]);
 export const boardPda = (season) => pda([enc.encode('season'), u16le(season)]);
 export const playerPda = (wallet) => pda([enc.encode('player'), wallet.toBytes()]);
 export const duelPda = (creator, seed) => pda([enc.encode('duel'), creator.toBytes(), u32le(seed)]);
@@ -92,7 +97,7 @@ export async function getConfig() {
   if (!data) return null;
   const r = new Reader(data);
   r.skip(8);
-  return {
+  const cfg = {
     admin: r.pubkey(),
     mint: r.pubkey(),
     season: r.u16(),
@@ -100,7 +105,10 @@ export async function getConfig() {
     seasonEnd: r.i64(),
     baseReward: r.u64(),
     referralBps: r.u16(),
+    carsMinted: [],
   };
+  for (let i = 0; i < CAR_MODELS; i++) cfg.carsMinted.push(r.u32());
+  return cfg;
 }
 
 export async function getBoard(season) {
@@ -276,6 +284,61 @@ export function cancelDuelIx(authority, seed) {
   ]);
 }
 
+export function mintCarIx(buyer, model, index) {
+  const fuel = fuelMintPda();
+  const carMint = carMintPda(model, index);
+  const metadata = PublicKey.findProgramAddressSync(
+    [enc.encode('metadata'), METADATA_PROGRAM_ID.toBytes(), carMint.toBytes()],
+    METADATA_PROGRAM_ID
+  )[0];
+  const edition = PublicKey.findProgramAddressSync(
+    [enc.encode('metadata'), METADATA_PROGRAM_ID.toBytes(), carMint.toBytes(), enc.encode('edition')],
+    METADATA_PROGRAM_ID
+  )[0];
+  return ix(IX.mintCar, new Uint8Array([model]), [
+    k(buyer, true, true),
+    k(configPda(), true),
+    k(fuel, true),
+    k(ataFor(buyer, fuel), true),
+    k(carMint, true),
+    k(ataFor(buyer, carMint), true),
+    k(metadata, true),
+    k(edition, true),
+    k(METADATA_PROGRAM_ID),
+    k(TOKEN_PROGRAM_ID),
+    k(ASSOCIATED_TOKEN_PROGRAM_ID),
+    k(SystemProgram.programId),
+    k(SYSVAR_RENT_PUBKEY),
+  ]);
+}
+
+// Which car models does this wallet hold as NFTs? Enumerates the
+// program's car mints (bounded by carsMinted) and checks the owner's
+// ATAs in batches — no indexer/DAS needed.
+export async function getOwnedCarModels(owner, cfg) {
+  const models = new Set();
+  const connection = getConnection();
+  const checks = [];
+  for (let model = 0; model < CAR_MODELS; model++) {
+    const count = Math.min(cfg.carsMinted[model] || 0, 64);
+    for (let i = 0; i < count; i++) {
+      checks.push({ model, ata: ataFor(owner, carMintPda(model, i)) });
+    }
+  }
+  for (let o = 0; o < checks.length; o += 100) {
+    const slice = checks.slice(o, o + 100);
+    const infos = await connection.getMultipleAccountsInfo(slice.map(c => c.ata));
+    infos.forEach((info, j) => {
+      if (!info || info.data.length < 72) return;
+      const amount = new DataView(
+        info.data.buffer, info.data.byteOffset + 64, 8
+      ).getBigUint64(0, true);
+      if (amount >= 1n) models.add(slice[j].model);
+    });
+  }
+  return [...models];
+}
+
 // ------------------------------------------------------------
 // High-level flows used by the game UI
 // ------------------------------------------------------------
@@ -305,6 +368,15 @@ export async function claimFuel() {
   const me = getPublicKey();
   if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
   return await sendIxs([claimIx(me)]);
+}
+
+// Mints the given car model as an NFT (price burned in FUEL).
+export async function mintCarNft(model) {
+  const me = getPublicKey();
+  if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
+  const cfg = await getConfig();
+  if (!cfg) { sol.error = 'PROGRAM NOT LIVE'; return ''; }
+  return await sendIxs([mintCarIx(me, model, cfg.carsMinted[model] || 0)]);
 }
 
 export async function registerWithReferrer(pendingReferrer) {

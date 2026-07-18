@@ -26,6 +26,11 @@ needs the Solana + Anchor toolchain.
 - `claim()` — mints `claimable` FUEL to the caller's ATA
 - `create_duel(seed, stake)` / `join_duel()` / `submit_duel_time(et_ms)` /
   `settle_duel()` / `cancel_duel()` — PvP flow, 3% rake burned
+- `mint_car(model)` — burns the FUEL price and mints the car as a Metaplex NFT
+  (metadata + master edition, 5% royalty) to the buyer; mints are enumerable via
+  `config.cars_minted` and PDA seeds `["carmint", model, index]`, so the client
+  detects wallet-held car NFTs without an indexer. Host the metadata JSONs
+  (name/image/attributes per model) at `NFT_BASE_URI` before mainnet.
 
 ## Deploy (on your machine)
 

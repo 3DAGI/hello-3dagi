@@ -9,7 +9,8 @@ import {
   getConfig, getBoard, getPlayer, getDuel, getFuelBalance,
   submitTimeOnChain, claimFuel, registerWithReferrer,
   createDuelIx, joinDuelIx, submitDuelTimeIx, settleDuelIx, cancelDuelIx,
-  DUEL_STAKES, FUEL_DECIMALS,
+  mintCarNft, getOwnedCarModels,
+  DUEL_STAKES, FUEL_DECIMALS, CAR_PRICES_FUEL,
 } from './chain.js';
 import { sendIxs } from './solana.js';
 import { PublicKey } from '@solana/web3.js';
@@ -312,6 +313,12 @@ const G = {
   slowmo: false, finishFlash: 0,
   paint: {},             // paint index per car (persisted)
   tune: {},              // {carId: {fd, nos}} dyno setup (persisted)
+  nftModels: [],         // car models this wallet holds as NFTs
+  // ranked mode (persisted)
+  rp: 0, rankedW: 0, rankedL: 0, rankedMonth: '',
+  rankedOpp: null,       // matched opponent {name, et, rp, car}
+  rankedSearchT: 0,      // >0 while the fake matchmaking runs
+  lastRpDelta: 0,
   // fx
   flash: null,
   particles: [],
@@ -343,6 +350,17 @@ function loadSave() {
       if (s.paint) G.paint = s.paint;
       if (s.tune) G.tune = s.tune;
       if (typeof s.distIdx === 'number') G.distIdx = Math.min(DISTANCES.length - 1, s.distIdx);
+      if (typeof s.rp === 'number') G.rp = s.rp;
+      if (typeof s.rankedW === 'number') G.rankedW = s.rankedW;
+      if (typeof s.rankedL === 'number') G.rankedL = s.rankedL;
+      if (typeof s.rankedMonth === 'string') G.rankedMonth = s.rankedMonth;
+      // soft season reset: half your points each month
+      const month = new Date().getFullYear() + '-' + new Date().getMonth();
+      if (G.rankedMonth !== month) {
+        G.rp = Math.floor(G.rp / 2);
+        G.rankedW = 0; G.rankedL = 0;
+        G.rankedMonth = month;
+      }
     }
   } catch {}
   for (const id of G.owned) if (!G.garage[id]) G.garage[id] = freshParts();
@@ -355,8 +373,65 @@ function save() {
       duel: G.duel, pendingReferrer: G.pendingReferrer,
       ghosts: G.ghosts, streak: G.streak, muted: G.muted,
       paint: G.paint, tune: G.tune, distIdx: G.distIdx,
+      rp: G.rp, rankedW: G.rankedW, rankedL: G.rankedL, rankedMonth: G.rankedMonth,
     }));
   } catch {}
+}
+
+// ------------------------------------------------------------
+// Ranked mode — Elo-style matchmaking against the ladder
+// ------------------------------------------------------------
+const DIVISIONS = [
+  { name: 'BRONZE', min: 0, color: '#c88a5a' },
+  { name: 'SILVER', min: 200, color: '#b8c0cc' },
+  { name: 'GOLD', min: 400, color: '#ffd166' },
+  { name: 'PLATINUM', min: 650, color: '#8ce8e0' },
+  { name: 'DIAMOND', min: 900, color: '#7ec8ff' },
+  { name: 'LEGEND', min: 1200, color: '#ff5c7a' },
+];
+
+function divisionOf(rp) {
+  let d = DIVISIONS[0];
+  for (const div of DIVISIONS) if (rp >= div.min) d = div;
+  return d;
+}
+
+// map rank points to the quarter-mile pace of that ladder tier
+const RP_ET = [[0, 17.4], [200, 15.8], [400, 14.4], [650, 13.0], [900, 11.6], [1200, 10.2], [1500, 9.0]];
+function etForRp(rp) {
+  for (let i = 1; i < RP_ET.length; i++) {
+    if (rp <= RP_ET[i][0]) {
+      const [r0, e0] = RP_ET[i - 1], [r1, e1] = RP_ET[i];
+      return e0 + (e1 - e0) * (rp - r0) / (r1 - r0);
+    }
+  }
+  return RP_ET[RP_ET.length - 1][1];
+}
+
+function findRankedOpponent() {
+  const oppRp = Math.max(0, G.rp + Math.round(Math.random() * 240 - 120));
+  const et = etForRp(oppRp) + (Math.random() * 0.5 - 0.25);
+  // real wallets from the on-chain board lend their names to the ladder
+  let name;
+  const boardNames = (G.board && G.board.entries.length)
+    ? G.board.entries.map(e => e.wallet.slice(0, 4) + '..' + e.wallet.slice(-4)) : [];
+  if (boardNames.length && Math.random() < 0.4) {
+    name = boardNames[Math.floor(Math.random() * boardNames.length)];
+  } else {
+    name = QUICK_RIVALS[Math.floor(Math.random() * QUICK_RIVALS.length)];
+  }
+  return { name, et, rp: oppRp, car: rivalCarFor(et) };
+}
+
+function startRankedRace() {
+  if (!G.rankedOpp) return;
+  G.mode = 'ranked';
+  G.distanceM = QUARTER_MILE;
+  G.aiEt = G.rankedOpp.et;
+  G.oppName = G.rankedOpp.name;
+  G.oppCar = G.rankedOpp.car;
+  G.theme = Math.floor(Math.random() * THEMES.length);
+  beginStaging();
 }
 
 function bestKey() {
@@ -511,6 +586,7 @@ function tapAnywhere(x, y, isKey) {
     if (G.time > 0.6) {
       if (G.mode === 'career') gotoScreen('career');
       else if (G.mode === 'duel') { gotoScreen('wallet'); G.chainTab = 'duel'; refreshChain(); }
+      else if (G.mode === 'ranked') gotoScreen('ranked');
       else gotoScreen('menu');
     }
     return;
@@ -558,7 +634,22 @@ function tapAnywhere(x, y, isKey) {
     }
     case 'tunefd': adjustTune('fd', h.idx); break;
     case 'tunenos': adjustTune('nos', h.idx); break;
+    case 'rankedsearch':
+      G.rankedSearchT = 1.2;
+      G.rankedOpp = null;
+      break;
+    case 'rankedrace': startRankedRace(); break;
+    case 'mintnft': doMintCarNft(); break;
   }
+}
+
+async function doMintCarNft() {
+  const model = G.dealerIdx;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) { setFlash(sol.error, PAL.red); return; } }
+  setFlash('SIGNING MINT TX...', PAL.nos);
+  const sig = await mintCarNft(model);
+  setFlash(sig ? 'CAR NFT MINTED!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
 }
 
 function adjustTune(k, delta) {
@@ -587,6 +678,16 @@ async function refreshChain(force) {
     if (me) {
       G.chainPlayer = await getPlayer(me);
       G.fuel = await getFuelBalance(me);
+      G.nftModels = await getOwnedCarModels(me, G.chainCfg);
+      // NFTs held in the wallet unlock their car model in-game
+      for (const m of G.nftModels) {
+        const car = CARS[m];
+        if (car && !G.owned.includes(car.id)) {
+          G.owned.push(car.id);
+          if (!G.garage[car.id]) G.garage[car.id] = freshParts();
+          save();
+        }
+      }
     }
     if (G.duel) {
       G.duelInfo = await getDuel(new PublicKey(G.duel.creator), G.duel.seed);
@@ -938,6 +1039,33 @@ function applyRewards() {
     G.earned = { total: 0, lines: ['DUEL RUN - SUBMIT YOUR TIME ON-CHAIN'] };
     return;
   }
+  if (G.mode === 'ranked') {
+    // Elo-style points vs the matched opponent
+    const opp = G.rankedOpp || { rp: G.rp };
+    const expected = 1 / (1 + Math.pow(10, (opp.rp - G.rp) / 400));
+    const div = divisionOf(G.rp);
+    const divIdx = DIVISIONS.indexOf(div);
+    if (won) {
+      G.lastRpDelta = Math.round(28 * (1 - expected)) + 4;
+      G.rankedW++;
+      total = 150 + divIdx * 125;
+      lines.push('RANKED WIN $' + total);
+    } else {
+      G.lastRpDelta = -(Math.round(28 * expected) + 4);
+      G.rankedL++;
+      total = 50;
+      lines.push('CONSOLATION $50');
+    }
+    G.rp = Math.max(0, G.rp + G.lastRpDelta);
+    G.rankedOpp = null;
+    if (G.launchKind === 'perfect') { total += 100; lines.push('LAUNCH $100'); }
+    if (G.perfectShifts > 0) { const b = G.perfectShifts * 50; total += b; lines.push('SHIFTS $' + b); }
+    if (G.newBest) { total += 100; lines.push('BEST $100'); }
+    G.cash += total;
+    G.earned = { total, lines };
+    save();
+    return;
+  }
   if (G.mode === 'career') {
     const stage = CAREER[G.career];
     if (won) {
@@ -1145,6 +1273,10 @@ function update(dt) {
   G.time += dt;
   if (G.flash) { G.flash.t -= dt; if (G.flash.t <= 0) G.flash = null; }
   if (G.shake > 0) G.shake -= dt;
+  if (G.rankedSearchT > 0) {
+    G.rankedSearchT -= dt;
+    if (G.rankedSearchT <= 0) G.rankedOpp = findRankedOpponent();
+  }
   updateParticles(dt);
 
   if (G.screen === 'staging') {
@@ -1628,18 +1760,20 @@ function drawMenu() {
   cashTag();
 
   // nav buttons (left column)
+  const div = divisionOf(G.rp);
   const items = [
     { label: G.career >= CAREER.length ? 'CAREER  DONE!' : 'CAREER  ' + (G.career + 1) + '/' + CAREER.length, idx: 'career', color: PAL.red },
+    { label: 'RANKED  ' + div.name + ' ' + G.rp, idx: 'ranked', color: div.color },
     { label: 'QUICK RACE', idx: 'quick', color: '#7ec8ff' },
     { label: 'GARAGE', idx: 'garage', color: PAL.cash },
     { label: 'DEALER', idx: 'dealer', color: PAL.green },
     { label: sol.connected ? 'WALLET ' + sol.shortAddress : 'WALLET', idx: 'wallet', color: PAL.nos },
   ];
   items.forEach((it, i) => {
-    const bx = 24, by = 56 + i * 40, bw = 190, bh = 33;
+    const bx = 24, by = 52 + i * 34, bw = 190, bh = 28;
     panel(bx, by, bw, bh, it.color);
     ctx.fillStyle = it.color;
-    pixText(it.label, bx + 14, by + 11, 12);
+    pixText(it.label, bx + 12, by + 9, 11);
     hits.push({ x: bx, y: by, w: bw, h: bh, action: 'goto', idx: it.idx });
   });
 
@@ -1666,7 +1800,7 @@ function drawMenu() {
   hits.push({ x: sx, y: sy, w: sw, h: sh, action: 'togglesound' });
 
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('3DAGI · v0.6 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
+  pixTextCenter('3DAGI · v0.7 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
   drawHUDFlash();
 }
 
@@ -1715,6 +1849,85 @@ function backButton() {
   ctx.fillStyle = PAL.text;
   pixTextCenter('< BACK', by + 8, 10);
   hits.push({ x: bx, y: by, w: bw, h: bh, action: 'goto', idx: 'menu' });
+}
+
+// ------------------------------------------------------------
+// Ranked screen — division ladder + matchmaking
+// ------------------------------------------------------------
+function drawRanked() {
+  starBg();
+  hits.length = 0;
+  ctx.fillStyle = PAL.text;
+  pixText('RANKED', 14, 10, 16);
+  ctx.fillStyle = PAL.dim;
+  pixText('MONTHLY SEASON · 1/4 MILE', 130, 15, 8);
+  cashTag();
+
+  const div = divisionOf(G.rp);
+  const divIdx = DIVISIONS.indexOf(div);
+  const next = DIVISIONS[divIdx + 1];
+
+  // division card
+  panel(24, 40, 200, 96, div.color);
+  ctx.fillStyle = div.color;
+  pixText(div.name, 38, 52, 16);
+  ctx.fillStyle = PAL.text;
+  pixText(G.rp + ' RP', 38, 74, 12);
+  ctx.fillStyle = PAL.dim;
+  pixText(G.rankedW + 'W - ' + G.rankedL + 'L THIS SEASON', 38, 92, 8);
+  // progress to next division
+  if (next) {
+    const p = (G.rp - div.min) / (next.min - div.min);
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(38, 108, 160, 7);
+    ctx.fillStyle = div.color;
+    ctx.fillRect(38, 108, 160 * Math.max(0.02, Math.min(1, p)), 7);
+    ctx.fillStyle = PAL.dim;
+    pixText(next.min - G.rp + ' RP TO ' + next.name, 38, 120, 7);
+  } else {
+    ctx.fillStyle = div.color;
+    pixText('TOP OF THE LADDER!', 38, 110, 8);
+  }
+
+  // matchmaking panel
+  panel(244, 40, 222, 96, PAL.border);
+  if (G.rankedSearchT > 0) {
+    const dots = '.'.repeat(1 + Math.floor(G.time * 4) % 3);
+    ctx.fillStyle = PAL.amber;
+    pixTextCenter('SEARCHING' + dots, 74, 12, 355);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('MATCHING BY RP ' + G.rp, 94, 8, 355);
+  } else if (G.rankedOpp) {
+    const o = G.rankedOpp;
+    ctx.fillStyle = PAL.text;
+    pixTextCenter('VS ' + o.name, 50, 11, 355);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('~RP ' + o.rp + ' · RUNS ~' + o.et.toFixed(1) + 's', 66, 8, 355);
+    drawCarSprite(o.car, 355 - o.car.sprite[0].length, 108 - carHeight(o.car), RIVAL_PAL, G.time * 8, 1);
+    chainButton(258, 108, 92, 22, 'RE-SEARCH', PAL.dim, 'rankedsearch');
+    chainButton(360, 108, 92, 22, 'RACE!', PAL.green, 'rankedrace');
+  } else {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('WIN VS STRONGER RIVALS', 58, 8, 355);
+    pixTextCenter('FOR BIGGER RP GAINS', 70, 8, 355);
+    chainButton(280, 90, 150, 30, 'FIND OPPONENT', PAL.green, 'rankedsearch');
+  }
+
+  // division ladder strip
+  DIVISIONS.forEach((d, i) => {
+    const bx = 24 + i * 74, by = 152, bw = 68, bh = 34;
+    const active = d === div;
+    panel(bx, by, bw, bh, active ? d.color : PAL.border);
+    ctx.fillStyle = active ? d.color : PAL.dim;
+    pixTextCenter(d.name, by + 6, 7, bx + bw / 2);
+    pixTextCenter(d.min + '+', by + 18, 7, bx + bw / 2);
+  });
+
+  ctx.fillStyle = PAL.dim;
+  pixTextCenter('SEASON RESETS MONTHLY (RP HALVED) · WIN CASH BY DIVISION', 198, 7);
+
+  backButton();
+  drawHUDFlash();
 }
 
 // ------------------------------------------------------------
@@ -1990,6 +2203,27 @@ function drawDealer() {
     ctx.fillStyle = carPal(car).b;
     pixTextCenter('PAINT >', by + 11, 11, px + pw / 2);
     hits.push({ x: px, y: by, w: pw, h: bh, action: 'paintcycle' });
+  }
+
+  // car NFTs: mint with FUEL (burned), tradeable on any marketplace
+  if (mwaSupported) {
+    const isNft = G.nftModels.includes(G.dealerIdx);
+    const nx = 20, ny = 214, nw = 110, nh = 40;
+    if (isNft) {
+      panel(nx, ny, nw, nh, PAL.nos);
+      ctx.fillStyle = PAL.nos;
+      pixTextCenter('NFT OWNED', ny + 8, 9, nx + nw / 2);
+      ctx.fillStyle = PAL.dim;
+      pixTextCenter('IN YOUR WALLET', ny + 22, 6, nx + nw / 2);
+    } else {
+      const live = !!G.chainCfg;
+      panel(nx, ny, nw, nh, live ? PAL.nos : PAL.border);
+      ctx.fillStyle = live ? PAL.nos : PAL.dim;
+      pixTextCenter('MINT NFT', ny + 8, 9, nx + nw / 2);
+      ctx.fillStyle = PAL.dim;
+      pixTextCenter(CAR_PRICES_FUEL[G.dealerIdx] + ' FUEL', ny + 22, 7, nx + nw / 2);
+      if (live) hits.push({ x: nx, y: ny, w: nw, h: nh, action: 'mintnft' });
+    }
   }
 
   backButton();
@@ -2348,6 +2582,13 @@ function drawResults() {
     pixTextCenter(G.earned.lines.join(' · '), 176, 8);
   }
 
+  // ranked: show the RP swing and new division
+  if (G.mode === 'ranked' && G.lastRpDelta !== 0) {
+    const div = divisionOf(G.rp);
+    ctx.fillStyle = G.lastRpDelta > 0 ? PAL.green : PAL.red;
+    pixTextCenter((G.lastRpDelta > 0 ? '+' : '') + G.lastRpDelta + ' RP  >  ' + G.rp + ' ' + div.name, 192, 11);
+  }
+
   if (G.mode === 'career' && !won) {
     ctx.fillStyle = PAL.dim;
     pixTextCenter('TUNE UP IN THE GARAGE AND RETRY', 192, 8);
@@ -2386,6 +2627,7 @@ function render() {
   switch (G.screen) {
     case 'menu': drawMenu(); break;
     case 'quick': drawQuick(); break;
+    case 'ranked': drawRanked(); break;
     case 'career': drawCareer(); break;
     case 'garage': drawGarage(); break;
     case 'tune': drawTune(); break;

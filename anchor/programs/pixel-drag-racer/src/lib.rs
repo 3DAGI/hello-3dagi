@@ -15,6 +15,11 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::metadata::{
+    create_master_edition_v3, create_metadata_accounts_v3,
+    mpl_token_metadata::types::{Creator, DataV2},
+    CreateMasterEditionV3, CreateMetadataAccountsV3, Metadata,
+};
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
 declare_id!("DmnJq3fTKxCzBAW965MxBGa25H9SmKKgSZ2YVNqQQFrh");
@@ -29,6 +34,16 @@ pub const RAKE_BPS: u64 = 300;       // 3% of every duel pot is burned
 pub const RANK_MULT: [u64; BOARD_SIZE] = [
     500, 300, 200, 100, 100, 100, 100, 100, 50, 50, 50, 50, 50, 50, 50, 50,
 ];
+
+// Car NFTs: models, mint prices in whole FUEL (burned = deflationary sink)
+pub const CAR_MODELS: usize = 5;
+pub const CAR_PRICES_FUEL: [u64; CAR_MODELS] = [2_000, 6_500, 18_000, 42_000, 110_000];
+pub const CAR_NAMES: [&str; CAR_MODELS] =
+    ["HATCH 86", "ROAD KING V8", "RX TURBO", "VIPER GT", "TOP FUEL X"];
+pub const NFT_SYMBOL: &str = "PDRCAR";
+pub const NFT_ROYALTY_BPS: u16 = 500; // 5% secondary-market royalty
+// metadata JSON per model, served by the project (image + attributes)
+pub const NFT_BASE_URI: &str = "https://raw.githubusercontent.com/3DAGI/hello-3dagi/main/nft/";
 
 #[program]
 pub mod pixel_drag_racer {
@@ -52,6 +67,7 @@ pub mod pixel_drag_racer {
         cfg.season_end = Clock::get()?.unix_timestamp + season_duration;
         cfg.base_reward = base_reward;
         cfg.referral_bps = referral_bps;
+        cfg.cars_minted = [0; CAR_MODELS];
         cfg.bump = ctx.bumps.config;
 
         let board = &mut ctx.accounts.board;
@@ -360,6 +376,101 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
+    /// Mints a car as a tradeable Metaplex NFT. The FUEL price is
+    /// burned (deflationary sink); the NFT itself trades freely on any
+    /// marketplace and unlocks the car model in-game for its holder.
+    pub fn mint_car(ctx: Context<MintCar>, model: u8) -> Result<()> {
+        require!((model as usize) < CAR_MODELS, PdrError::BadParams);
+        let index = ctx.accounts.config.cars_minted[model as usize];
+        let price = CAR_PRICES_FUEL[model as usize] * 1_000_000; // 6 decimals
+
+        // pay: burn FUEL from the buyer
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.fuel_mint.to_account_info(),
+                    from: ctx.accounts.buyer_fuel_ata.to_account_info(),
+                    authority: ctx.accounts.buyer.to_account_info(),
+                },
+            ),
+            price,
+        )?;
+
+        let bump = ctx.accounts.config.bump;
+        let seeds: &[&[u8]] = &[b"config", &[bump]];
+
+        // mint the single edition to the buyer
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.car_mint.to_account_info(),
+                    to: ctx.accounts.buyer_car_ata.to_account_info(),
+                    authority: ctx.accounts.config.to_account_info(),
+                },
+                &[seeds],
+            ),
+            1,
+        )?;
+
+        // Metaplex metadata + master edition = a real, tradeable NFT
+        let name = format!("PDR {} #{}", CAR_NAMES[model as usize], index + 1);
+        let uri = format!("{}{}.json", NFT_BASE_URI, model);
+        create_metadata_accounts_v3(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                CreateMetadataAccountsV3 {
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    mint: ctx.accounts.car_mint.to_account_info(),
+                    mint_authority: ctx.accounts.config.to_account_info(),
+                    update_authority: ctx.accounts.config.to_account_info(),
+                    payer: ctx.accounts.buyer.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+                &[seeds],
+            ),
+            DataV2 {
+                name,
+                symbol: NFT_SYMBOL.to_string(),
+                uri,
+                seller_fee_basis_points: NFT_ROYALTY_BPS,
+                creators: Some(vec![Creator {
+                    address: ctx.accounts.config.key(),
+                    verified: true,
+                    share: 100,
+                }]),
+                collection: None,
+                uses: None,
+            },
+            true, // is_mutable
+            true, // update_authority_is_signer (config PDA signs)
+            None,
+        )?;
+        create_master_edition_v3(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_metadata_program.to_account_info(),
+                CreateMasterEditionV3 {
+                    edition: ctx.accounts.master_edition.to_account_info(),
+                    mint: ctx.accounts.car_mint.to_account_info(),
+                    update_authority: ctx.accounts.config.to_account_info(),
+                    mint_authority: ctx.accounts.config.to_account_info(),
+                    payer: ctx.accounts.buyer.to_account_info(),
+                    metadata: ctx.accounts.metadata.to_account_info(),
+                    token_program: ctx.accounts.token_program.to_account_info(),
+                    system_program: ctx.accounts.system_program.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+                &[seeds],
+            ),
+            Some(0), // max_supply 0 = 1/1, no prints
+        )?;
+
+        ctx.accounts.config.cars_minted[model as usize] = index + 1;
+        Ok(())
+    }
+
     /// Creator can reclaim the stake if nobody joined before the deadline.
     pub fn cancel_duel(ctx: Context<CancelDuel>) -> Result<()> {
         let duel = &ctx.accounts.duel;
@@ -401,10 +512,11 @@ pub struct Config {
     pub season_end: i64,
     pub base_reward: u64,
     pub referral_bps: u16,
+    pub cars_minted: [u32; CAR_MODELS],
     pub bump: u8,
 }
 impl Config {
-    pub const SIZE: usize = 8 + 32 + 32 + 2 + 8 + 8 + 8 + 2 + 1;
+    pub const SIZE: usize = 8 + 32 + 32 + 2 + 8 + 8 + 8 + 2 + 4 * CAR_MODELS + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq)]
@@ -611,6 +723,51 @@ pub struct CreateDuel<'info> {
     pub creator_ata: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+#[instruction(model: u8)]
+pub struct MintCar<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, address = config.mint)]
+    pub fuel_mint: Account<'info, Mint>,
+    #[account(mut, constraint = buyer_fuel_ata.owner == buyer.key() @ PdrError::WrongAta)]
+    pub buyer_fuel_ata: Account<'info, TokenAccount>,
+    #[account(
+        init,
+        payer = buyer,
+        mint::decimals = 0,
+        mint::authority = config,
+        mint::freeze_authority = config,
+        seeds = [
+            b"carmint".as_ref(),
+            &[model],
+            config.cars_minted[model as usize].to_le_bytes().as_ref()
+        ],
+        bump
+    )]
+    pub car_mint: Account<'info, Mint>,
+    #[account(
+        init_if_needed,
+        payer = buyer,
+        associated_token::mint = car_mint,
+        associated_token::authority = buyer
+    )]
+    pub buyer_car_ata: Account<'info, TokenAccount>,
+    /// CHECK: verified by the token metadata program CPI
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    /// CHECK: verified by the token metadata program CPI
+    #[account(mut)]
+    pub master_edition: UncheckedAccount<'info>,
+    pub token_metadata_program: Program<'info, Metadata>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
 
