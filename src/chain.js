@@ -19,11 +19,34 @@ export const FUEL_DECIMALS = 6;
 export const BOARD_SIZE = 16;
 export const DUEL_STAKES = [25, 100, 500]; // whole FUEL
 export const CAR_MODELS = 5;
-export const CAR_PRICES_FUEL = [2000, 6500, 18000, 42000, 110000]; // whole FUEL, burned on mint
+export const CAR_PRICES_FUEL = [2000, 6500, 18000, 42000, 110000]; // whole FUEL
+export const PACK_PRICES_FUEL = [250, 800, 2000]; // whole FUEL
+export const BOSS_REWARDS_FUEL = [25, 50, 100, 250]; // whole FUEL
+
+// payment currencies: FUEL burns, SOL/SKR split pool/treasury
+export const CUR_FUEL = 0, CUR_SOL = 1, CUR_SKR = 2;
+export const CUR_NAMES = ['FUEL', 'SOL', 'SKR'];
+
+export function solCost(cfg, fuelWhole) {
+  return fuelWhole * 1e6 * cfg.solRate / 1e6 / 1e9; // → SOL
+}
+export function skrCost(cfg, fuelWhole) {
+  const raw = fuelWhole * 1e6 * cfg.skrRate / 1e6;
+  return raw * (10000 - cfg.skrDiscountBps) / 10000 / 1e6; // → whole SKR (6dp assumed for display)
+}
+export function fmtPrice(cfg, fuelWhole, currency) {
+  if (currency === CUR_SOL) return solCost(cfg, fuelWhole).toFixed(3) + ' SOL';
+  if (currency === CUR_SKR) return skrCost(cfg, fuelWhole).toFixed(1) + ' SKR';
+  return fuelWhole + ' FUEL';
+}
 
 // sha256("global:<ix>")[0..8] / sha256("account:<name>")[0..8]
 const IX = {
   mintCar: [125, 246, 210, 195, 91, 198, 69, 131],
+  setRates: [53, 124, 188, 253, 56, 211, 29, 2],
+  buyPack: [151, 46, 141, 93, 174, 5, 49, 173],
+  openPack: [75, 203, 144, 65, 63, 253, 103, 85],
+  claimCareerBoss: [182, 226, 24, 126, 67, 197, 76, 96],
   listNft: [88, 221, 93, 166, 63, 220, 106, 232],
   buyNft: [96, 0, 28, 190, 49, 107, 83, 222],
   cancelListing: [41, 183, 50, 232, 230, 233, 157, 70],
@@ -60,6 +83,8 @@ export const matchPda = (a, b) => pda([enc.encode('match'), a.toBytes(), b.toByt
 export const mvaultPda = (m) => pda([enc.encode('mvault'), m.toBytes()]);
 export const listingPda = (mint) => pda([enc.encode('listing'), mint.toBytes()]);
 export const lvaultPda = (mint) => pda([enc.encode('lvault'), mint.toBytes()]);
+export const solPoolPda = () => pda([enc.encode('solpool')]);
+export const skrPoolPda = () => pda([enc.encode('skrpool')]);
 export const boardPda = (season) => pda([enc.encode('season'), u16le(season)]);
 export const playerPda = (wallet) => pda([enc.encode('player'), wallet.toBytes()]);
 export const duelPda = (creator, seed) => pda([enc.encode('duel'), creator.toBytes(), u32le(seed)]);
@@ -122,6 +147,13 @@ export async function getConfig() {
     carsMinted: [],
   };
   for (let i = 0; i < CAR_MODELS; i++) cfg.carsMinted.push(r.u32());
+  cfg.skrMint = r.pubkey();
+  cfg.treasury = r.pubkey();
+  cfg.solRate = r.u64();
+  cfg.skrRate = r.u64();
+  cfg.skrDiscountBps = r.u16();
+  cfg.committedSol = r.u64();
+  cfg.committedSkr = r.u64();
   return cfg;
 }
 
@@ -160,9 +192,24 @@ export async function getPlayer(wallet) {
     referralEarned: r.u64(),
     rp: r.u16(),
     activeMatch: r.pubkey(),
+    claimableSol: r.u64(),
+    claimableSkr: r.u64(),
+    packCredits: [r.u16(), r.u16(), r.u16()],
+    careerBosses: r.u8(),
   };
   if (p.activeMatch.equals(PublicKey.default)) p.activeMatch = null;
   return p;
+}
+
+export async function getSolBalance(owner) {
+  try { return (await getConnection().getBalance(owner)) / 1e9; } catch { return 0; }
+}
+
+export async function getSkrBalance(owner, cfg) {
+  try {
+    const res = await getConnection().getTokenAccountBalance(ataFor(owner, cfg.skrMint));
+    return Number(res.value.uiAmount) || 0;
+  } catch { return 0; }
 }
 
 export async function getQueue() {
@@ -260,14 +307,18 @@ export function submitTimeIx(authority, season, etMs, car, referrer) {
   ]);
 }
 
-export function claimIx(authority) {
+export function claimIx(authority, cfg) {
   const mint = fuelMintPda();
   return ix(IX.claim, new Uint8Array(0), [
     k(authority, true, true),
-    k(configPda()),
+    k(configPda(), true),
     k(mint, true),
+    k(cfg.skrMint),
     k(playerPda(authority), true),
     k(ataFor(authority, mint), true),
+    k(solPoolPda(), true),
+    k(skrPoolPda(), true),
+    k(ataFor(authority, cfg.skrMint), true),
     k(SystemProgram.programId),
     k(TOKEN_PROGRAM_ID),
     k(ASSOCIATED_TOKEN_PROGRAM_ID),
@@ -335,7 +386,21 @@ export function cancelDuelIx(authority, seed) {
   ]);
 }
 
-export function mintCarIx(buyer, model, index) {
+// the optional payment accounts, in context order; unused optionals
+// are encoded as the program id (Anchor's "None" convention)
+function paymentKeys(buyer, currency, cfg) {
+  const fuel = fuelMintPda();
+  return [
+    currency === CUR_FUEL ? k(ataFor(buyer, fuel), true) : k(PROGRAM_ID),
+    k(solPoolPda(), true),
+    k(cfg.treasury, true),
+    k(skrPoolPda(), true),
+    currency === CUR_SKR ? k(ataFor(buyer, cfg.skrMint), true) : k(PROGRAM_ID),
+    currency === CUR_SKR ? k(ataFor(cfg.treasury, cfg.skrMint), true) : k(PROGRAM_ID),
+  ];
+}
+
+export function mintCarIx(buyer, model, index, currency, cfg) {
   const fuel = fuelMintPda();
   const carMint = carMintPda(model, index);
   const metadata = PublicKey.findProgramAddressSync(
@@ -346,11 +411,11 @@ export function mintCarIx(buyer, model, index) {
     [enc.encode('metadata'), METADATA_PROGRAM_ID.toBytes(), carMint.toBytes(), enc.encode('edition')],
     METADATA_PROGRAM_ID
   )[0];
-  return ix(IX.mintCar, new Uint8Array([model]), [
+  return ix(IX.mintCar, new Uint8Array([model, currency]), [
     k(buyer, true, true),
     k(configPda(), true),
     k(fuel, true),
-    k(ataFor(buyer, fuel), true),
+    ...paymentKeys(buyer, currency, cfg),
     k(carMint, true),
     k(ataFor(buyer, carMint), true),
     k(metadata, true),
@@ -360,6 +425,34 @@ export function mintCarIx(buyer, model, index) {
     k(ASSOCIATED_TOKEN_PROGRAM_ID),
     k(SystemProgram.programId),
     k(SYSVAR_RENT_PUBKEY),
+  ]);
+}
+
+export function buyPackIx(buyer, tier, currency, cfg) {
+  const fuel = fuelMintPda();
+  const pay = paymentKeys(buyer, currency, cfg);
+  return ix(IX.buyPack, new Uint8Array([tier, currency]), [
+    k(buyer, true, true),
+    k(configPda()),
+    k(fuel, true),
+    k(playerPda(buyer), true),
+    ...pay,
+    k(TOKEN_PROGRAM_ID),
+    k(SystemProgram.programId),
+  ]);
+}
+
+export function openPackIx(authority, tier) {
+  return ix(IX.openPack, new Uint8Array([tier]), [
+    k(authority, false, true),
+    k(playerPda(authority), true),
+  ]);
+}
+
+export function claimCareerBossIx(authority, boss) {
+  return ix(IX.claimCareerBoss, new Uint8Array([boss]), [
+    k(authority, false, true),
+    k(playerPda(authority), true),
   ]);
 }
 
@@ -417,6 +510,7 @@ export async function getListings(cfg) {
         mint: r.pubkey(),
         model: r.u8(),
         price: r.u64(),
+        currency: r.u8(),
         ts: r.i64(),
         index: slice[j].index,
       });
@@ -426,10 +520,11 @@ export async function getListings(cfg) {
   return out;
 }
 
-export function listNftIx(seller, model, index, priceFuel) {
+// price is in the listing currency's base units
+export function listNftIx(seller, model, index, priceUnits, currency) {
   const mint = carMintPda(model, index);
-  const price = BigInt(Math.round(priceFuel * 10 ** FUEL_DECIMALS));
-  return ix(IX.listNft, cat(new Uint8Array([model]), u32le(index), u64le(price)), [
+  const price = BigInt(Math.round(priceUnits));
+  return ix(IX.listNft, cat(new Uint8Array([model]), u32le(index), u64le(price), new Uint8Array([currency])), [
     k(seller, true, true),
     k(configPda()),
     k(mint),
@@ -442,8 +537,9 @@ export function listNftIx(seller, model, index, priceFuel) {
   ]);
 }
 
-export function buyNftIx(buyer, listing) {
+export function buyNftIx(buyer, listing, cfg) {
   const fuel = fuelMintPda();
+  const cur = listing.currency;
   return ix(IX.buyNft, new Uint8Array(0), [
     k(buyer, true, true),
     k(configPda()),
@@ -452,8 +548,14 @@ export function buyNftIx(buyer, listing) {
     k(listing.seller, true),
     k(listing.mint),
     k(lvaultPda(listing.mint), true),
-    k(ataFor(buyer, fuel), true),
-    k(ataFor(listing.seller, fuel), true),
+    cur === CUR_FUEL ? k(ataFor(buyer, fuel), true) : k(PROGRAM_ID),
+    cur === CUR_FUEL ? k(ataFor(listing.seller, fuel), true) : k(PROGRAM_ID),
+    k(solPoolPda(), true),
+    k(cfg.treasury, true),
+    k(skrPoolPda(), true),
+    cur === CUR_SKR ? k(ataFor(buyer, cfg.skrMint), true) : k(PROGRAM_ID),
+    cur === CUR_SKR ? k(ataFor(listing.seller, cfg.skrMint), true) : k(PROGRAM_ID),
+    cur === CUR_SKR ? k(ataFor(cfg.treasury, cfg.skrMint), true) : k(PROGRAM_ID),
     k(ataFor(buyer, listing.mint), true),
     k(TOKEN_PROGRAM_ID),
     k(ASSOCIATED_TOKEN_PROGRAM_ID),
@@ -499,7 +601,33 @@ export async function submitTimeOnChain(etMs, car, pendingReferrer) {
 export async function claimFuel() {
   const me = getPublicKey();
   if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
-  return await sendIxs([claimIx(me)]);
+  const cfg = await getConfig();
+  if (!cfg) { sol.error = 'PROGRAM NOT LIVE'; return ''; }
+  return await sendIxs([claimIx(me, cfg)]);
+}
+
+// Buy a pack on-chain in the chosen currency; credit lands on the
+// player profile and the game opens it.
+export async function buyPackOnChain(tier, currency) {
+  const me = getPublicKey();
+  if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
+  const cfg = await getConfig();
+  if (!cfg) { sol.error = 'PROGRAM NOT LIVE'; return ''; }
+  if (!(await getPlayer(me))) { sol.error = 'SUBMIT A TIME FIRST TO REGISTER'; return ''; }
+  return await sendIxs([buyPackIx(me, tier, currency, cfg)]);
+}
+
+export async function openPackOnChain(tier) {
+  const me = getPublicKey();
+  if (!me) return '';
+  return await sendIxs([openPackIx(me, tier)]);
+}
+
+export async function claimCareerBoss(boss) {
+  const me = getPublicKey();
+  if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
+  if (!(await getPlayer(me))) { sol.error = 'SUBMIT A TIME FIRST TO REGISTER'; return ''; }
+  return await sendIxs([claimCareerBossIx(me, boss)]);
 }
 
 // ------------------------------------------------------------
@@ -610,13 +738,13 @@ export async function leaveRankedQueue() {
   return await sendIxs([queueLeaveIx(me)]);
 }
 
-// Mints the given car model as an NFT (price burned in FUEL).
-export async function mintCarNft(model) {
+// Mints the given car model as an NFT, paid in the chosen currency.
+export async function mintCarNft(model, currency) {
   const me = getPublicKey();
   if (!me) { sol.error = 'CONNECT WALLET FIRST'; return ''; }
   const cfg = await getConfig();
   if (!cfg) { sol.error = 'PROGRAM NOT LIVE'; return ''; }
-  return await sendIxs([mintCarIx(me, model, cfg.carsMinted[model] || 0)]);
+  return await sendIxs([mintCarIx(me, model, cfg.carsMinted[model] || 0, currency, cfg)]);
 }
 
 export async function registerWithReferrer(pendingReferrer) {

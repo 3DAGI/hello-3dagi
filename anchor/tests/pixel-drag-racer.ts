@@ -23,9 +23,19 @@ describe("pixel-drag-racer", () => {
     [Buffer.from("player"), w.toBuffer()], program.programId)[0];
 
   it("initializes", async () => {
+    // any SPL mint stands in for SKR on localnet/devnet
+    const { createMint } = await import("@solana/spl-token");
+    const skrMint = await createMint(provider.connection, (provider.wallet as any).payer, me, null, 6);
     await program.methods
-      .initialize(new BN(14 * 86400), new BN(10_000_000), 500)
-      .accounts({ admin: me, config, mint, board: board(0) })
+      .initialize(
+        new BN(14 * 86400), // season length
+        new BN(10_000_000), // 10 FUEL base reward
+        500,                // 5% referral
+        new BN(5_000),      // lamports per whole FUEL
+        new BN(10_000),     // SKR units per whole FUEL
+        1_000               // 10% SKR discount
+      )
+      .accounts({ admin: me, config, mint, board: board(0), skrMint, treasury: me })
       .rpc();
   });
 

@@ -14,6 +14,7 @@
 // ============================================================
 
 use anchor_lang::prelude::*;
+use anchor_lang::system_program;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::metadata::{
     create_master_edition_v3, create_metadata_accounts_v3,
@@ -36,7 +37,103 @@ pub const RANK_MULT: [u64; BOARD_SIZE] = [
 ];
 
 // In-game NFT marketplace
-pub const MARKET_FEE_BPS: u64 = 300; // 3% of every sale, burned
+pub const MARKET_FEE_BPS: u64 = 300; // 3% of every sale (FUEL: burned; SOL/SKR: pool+treasury)
+
+// Payment currencies. FUEL is the native unit of account; SOL and SKR
+// are payment rails converted at admin-set rates. FUEL payments burn;
+// SOL/SKR payments split 50% season prize pool / 50% treasury.
+pub const CUR_FUEL: u8 = 0;
+pub const CUR_SOL: u8 = 1;
+pub const CUR_SKR: u8 = 2;
+
+// On-chain pack prices in whole FUEL (contents granted as credits)
+pub const PACK_PRICES_FUEL: [u64; 3] = [250, 800, 2_000];
+// Career boss rewards in whole FUEL (claimed once per boss)
+pub const BOSS_REWARDS_FUEL: [u64; 4] = [25, 50, 100, 250];
+// Sum of RANK_MULT — pro-rata denominator for season pools
+pub const RANK_MULT_TOTAL: u64 = 1_900;
+
+fn sol_cost(cfg: &Config, fuel_units: u64) -> u64 {
+    (fuel_units as u128 * cfg.sol_rate as u128 / 1_000_000) as u64
+}
+fn skr_cost(cfg: &Config, fuel_units: u64) -> u64 {
+    let raw = fuel_units as u128 * cfg.skr_rate as u128 / 1_000_000;
+    (raw * (10_000 - cfg.skr_discount_bps as u128) / 10_000) as u64
+}
+
+// Takes a payment priced in FUEL units in the chosen currency.
+// FUEL burns; SOL/SKR split 50% season prize pool / 50% treasury.
+#[allow(clippy::too_many_arguments)]
+fn take_payment<'info>(
+    cfg: &Config,
+    currency: u8,
+    fuel_price_units: u64,
+    payer: AccountInfo<'info>,
+    fuel_mint: AccountInfo<'info>,
+    payer_fuel_ata: Option<AccountInfo<'info>>,
+    sol_pool: AccountInfo<'info>,
+    treasury: AccountInfo<'info>,
+    payer_skr_ata: Option<AccountInfo<'info>>,
+    skr_pool: AccountInfo<'info>,
+    treasury_skr_ata: Option<AccountInfo<'info>>,
+    token_program: AccountInfo<'info>,
+    system: AccountInfo<'info>,
+) -> Result<()> {
+    match currency {
+        CUR_FUEL => {
+            let ata = payer_fuel_ata.ok_or(PdrError::BadParams)?;
+            token::burn(
+                CpiContext::new(
+                    token_program,
+                    Burn { mint: fuel_mint, from: ata, authority: payer },
+                ),
+                fuel_price_units,
+            )?;
+        }
+        CUR_SOL => {
+            let lamports = sol_cost(cfg, fuel_price_units);
+            require!(lamports > 0, PdrError::RatesNotSet);
+            let half = lamports / 2;
+            system_program::transfer(
+                CpiContext::new(
+                    system.clone(),
+                    system_program::Transfer { from: payer.clone(), to: sol_pool },
+                ),
+                half,
+            )?;
+            system_program::transfer(
+                CpiContext::new(
+                    system,
+                    system_program::Transfer { from: payer, to: treasury },
+                ),
+                lamports - half,
+            )?;
+        }
+        CUR_SKR => {
+            let amount = skr_cost(cfg, fuel_price_units);
+            require!(amount > 0, PdrError::RatesNotSet);
+            let from = payer_skr_ata.ok_or(PdrError::BadParams)?;
+            let tre = treasury_skr_ata.ok_or(PdrError::BadParams)?;
+            let half = amount / 2;
+            token::transfer(
+                CpiContext::new(
+                    token_program.clone(),
+                    Transfer { from: from.clone(), to: skr_pool, authority: payer.clone() },
+                ),
+                half,
+            )?;
+            token::transfer(
+                CpiContext::new(
+                    token_program,
+                    Transfer { from, to: tre, authority: payer },
+                ),
+                amount - half,
+            )?;
+        }
+        _ => return err!(PdrError::BadParams),
+    }
+    Ok(())
+}
 
 // Ranked on-chain queue
 pub const QUEUE_SIZE: usize = 8;
@@ -66,9 +163,13 @@ pub mod pixel_drag_racer {
         season_duration: i64,
         base_reward: u64,
         referral_bps: u16,
+        sol_rate: u64,
+        skr_rate: u64,
+        skr_discount_bps: u16,
     ) -> Result<()> {
         require!(season_duration > 0, PdrError::BadParams);
         require!(referral_bps <= 2_000, PdrError::BadParams); // max 20%
+        require!(skr_discount_bps <= 3_000, PdrError::BadParams); // max 30%
         let cfg = &mut ctx.accounts.config;
         cfg.admin = ctx.accounts.admin.key();
         cfg.mint = ctx.accounts.mint.key();
@@ -78,11 +179,33 @@ pub mod pixel_drag_racer {
         cfg.base_reward = base_reward;
         cfg.referral_bps = referral_bps;
         cfg.cars_minted = [0; CAR_MODELS];
+        cfg.skr_mint = ctx.accounts.skr_mint.key();
+        cfg.treasury = ctx.accounts.treasury.key();
+        cfg.sol_rate = sol_rate;
+        cfg.skr_rate = skr_rate;
+        cfg.skr_discount_bps = skr_discount_bps;
+        cfg.committed_sol = 0;
+        cfg.committed_skr = 0;
         cfg.bump = ctx.bumps.config;
 
         let board = &mut ctx.accounts.board;
         board.season = 0;
         board.entries = [BoardEntry::default(); BOARD_SIZE];
+        Ok(())
+    }
+
+    /// Admin: adjust the SOL/SKR exchange rates and the SKR discount.
+    pub fn set_rates(
+        ctx: Context<SetRates>,
+        sol_rate: u64,
+        skr_rate: u64,
+        skr_discount_bps: u16,
+    ) -> Result<()> {
+        require!(skr_discount_bps <= 3_000, PdrError::BadParams);
+        let cfg = &mut ctx.accounts.config;
+        cfg.sol_rate = sol_rate;
+        cfg.skr_rate = skr_rate;
+        cfg.skr_discount_bps = skr_discount_bps;
         Ok(())
     }
 
@@ -103,6 +226,10 @@ pub mod pixel_drag_racer {
         player.referral_earned = 0;
         player.rp = RANKED_START_RP;
         player.active_match = Pubkey::default();
+        player.claimable_sol = 0;
+        player.claimable_skr = 0;
+        player.pack_credits = [0; 3];
+        player.career_bosses = 0;
         player.bump = ctx.bumps.player;
 
         // count the referral on the referrer's profile (if provided)
@@ -187,6 +314,15 @@ pub mod pixel_drag_racer {
         let board = &mut ctx.accounts.board;
         require!(board.season == cfg.season, PdrError::WrongBoard);
 
+        // season prize pools: whatever SOL/SKR revenue accumulated and
+        // is not yet promised gets distributed by rank weight
+        let pool_sol = ctx
+            .accounts
+            .sol_pool
+            .lamports()
+            .saturating_sub(cfg.committed_sol);
+        let pool_skr = ctx.accounts.skr_pool.amount.saturating_sub(cfg.committed_skr);
+
         // pay ranks: remaining_accounts[i] must be the Player PDA of
         // board.entries[i] (skip empty slots)
         for (rank, entry) in board.entries.iter().enumerate() {
@@ -202,6 +338,12 @@ pub mod pixel_drag_racer {
             require!(info.key() == expect, PdrError::RankAccountMismatch);
             let mut acc: Account<Player> = Account::try_from(info)?;
             acc.claimable += cfg.base_reward * RANK_MULT[rank];
+            let share_sol = pool_sol * RANK_MULT[rank] / RANK_MULT_TOTAL;
+            let share_skr = pool_skr * RANK_MULT[rank] / RANK_MULT_TOTAL;
+            acc.claimable_sol += share_sol;
+            acc.claimable_skr += share_skr;
+            cfg.committed_sol += share_sol;
+            cfg.committed_skr += share_skr;
             acc.exit(ctx.program_id)?;
         }
 
@@ -212,26 +354,66 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
-    /// Mint all claimable $FUEL to the player's token account.
+    /// Pay out everything claimable: FUEL is minted, SOL and SKR come
+    /// out of the season prize pools.
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
-        let amount = ctx.accounts.player.claimable;
-        require!(amount > 0, PdrError::NothingToClaim);
+        let fuel = ctx.accounts.player.claimable;
+        let sol = ctx.accounts.player.claimable_sol;
+        let skr = ctx.accounts.player.claimable_skr;
+        require!(fuel > 0 || sol > 0 || skr > 0, PdrError::NothingToClaim);
         ctx.accounts.player.claimable = 0;
+        ctx.accounts.player.claimable_sol = 0;
+        ctx.accounts.player.claimable_skr = 0;
 
         let bump = ctx.accounts.config.bump;
         let seeds: &[&[u8]] = &[b"config", &[bump]];
-        token::mint_to(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                MintTo {
-                    mint: ctx.accounts.mint.to_account_info(),
-                    to: ctx.accounts.player_ata.to_account_info(),
-                    authority: ctx.accounts.config.to_account_info(),
-                },
-                &[seeds],
-            ),
-            amount,
-        )?;
+        if fuel > 0 {
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint: ctx.accounts.mint.to_account_info(),
+                        to: ctx.accounts.player_ata.to_account_info(),
+                        authority: ctx.accounts.config.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                fuel,
+            )?;
+        }
+        if sol > 0 {
+            let pool_bump = ctx.bumps.sol_pool;
+            let pool_seeds: &[&[u8]] = &[b"solpool", &[pool_bump]];
+            system_program::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.system_program.to_account_info(),
+                    system_program::Transfer {
+                        from: ctx.accounts.sol_pool.to_account_info(),
+                        to: ctx.accounts.authority.to_account_info(),
+                    },
+                    &[pool_seeds],
+                ),
+                sol,
+            )?;
+            ctx.accounts.config.committed_sol =
+                ctx.accounts.config.committed_sol.saturating_sub(sol);
+        }
+        if skr > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.skr_pool.to_account_info(),
+                        to: ctx.accounts.player_skr_ata.to_account_info(),
+                        authority: ctx.accounts.config.to_account_info(),
+                    },
+                    &[seeds],
+                ),
+                skr,
+            )?;
+            ctx.accounts.config.committed_skr =
+                ctx.accounts.config.committed_skr.saturating_sub(skr);
+        }
         Ok(())
     }
 
@@ -647,25 +829,28 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
-    /// Mints a car as a tradeable Metaplex NFT. The FUEL price is
-    /// burned (deflationary sink); the NFT itself trades freely on any
-    /// marketplace and unlocks the car model in-game for its holder.
-    pub fn mint_car(ctx: Context<MintCar>, model: u8) -> Result<()> {
+    /// Mints a car as a tradeable Metaplex NFT, paid in FUEL (burned),
+    /// SOL or SKR (both split 50% season pool / 50% treasury, SKR with
+    /// the ecosystem discount). Unlocks the model in-game for holders.
+    pub fn mint_car(ctx: Context<MintCar>, model: u8, currency: u8) -> Result<()> {
         require!((model as usize) < CAR_MODELS, PdrError::BadParams);
         let index = ctx.accounts.config.cars_minted[model as usize];
         let price = CAR_PRICES_FUEL[model as usize] * 1_000_000; // 6 decimals
 
-        // pay: burn FUEL from the buyer
-        token::burn(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Burn {
-                    mint: ctx.accounts.fuel_mint.to_account_info(),
-                    from: ctx.accounts.buyer_fuel_ata.to_account_info(),
-                    authority: ctx.accounts.buyer.to_account_info(),
-                },
-            ),
+        take_payment(
+            &ctx.accounts.config,
+            currency,
             price,
+            ctx.accounts.buyer.to_account_info(),
+            ctx.accounts.fuel_mint.to_account_info(),
+            ctx.accounts.buyer_fuel_ata.as_ref().map(|a| a.to_account_info()),
+            ctx.accounts.sol_pool.to_account_info(),
+            ctx.accounts.treasury.to_account_info(),
+            ctx.accounts.buyer_skr_ata.as_ref().map(|a| a.to_account_info()),
+            ctx.accounts.skr_pool.to_account_info(),
+            ctx.accounts.treasury_skr_ata.as_ref().map(|a| a.to_account_info()),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
         )?;
 
         let bump = ctx.accounts.config.bump;
@@ -742,11 +927,63 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
-    /// Marketplace: list a car NFT for sale (priced in FUEL). The NFT
-    /// moves into a listing escrow until it sells or is cancelled.
-    pub fn list_nft(ctx: Context<ListNft>, model: u8, index: u32, price: u64) -> Result<()> {
+    /// Buy a shop pack with FUEL (burned), SOL or SKR (pool/treasury
+    /// split). The pack lands as an on-chain credit the game opens.
+    pub fn buy_pack(ctx: Context<BuyPack>, tier: u8, currency: u8) -> Result<()> {
+        require!((tier as usize) < PACK_PRICES_FUEL.len(), PdrError::BadParams);
+        let price = PACK_PRICES_FUEL[tier as usize] * 1_000_000;
+        take_payment(
+            &ctx.accounts.config,
+            currency,
+            price,
+            ctx.accounts.buyer.to_account_info(),
+            ctx.accounts.fuel_mint.to_account_info(),
+            ctx.accounts.buyer_fuel_ata.as_ref().map(|a| a.to_account_info()),
+            ctx.accounts.sol_pool.to_account_info(),
+            ctx.accounts.treasury.to_account_info(),
+            ctx.accounts.buyer_skr_ata.as_ref().map(|a| a.to_account_info()),
+            ctx.accounts.skr_pool.to_account_info(),
+            ctx.accounts.treasury_skr_ata.as_ref().map(|a| a.to_account_info()),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
+        )?;
+        ctx.accounts.player.pack_credits[tier as usize] += 1;
+        Ok(())
+    }
+
+    /// The game marks a pack credit as opened (contents granted).
+    pub fn open_pack(ctx: Context<OpenPack>, tier: u8) -> Result<()> {
+        require!((tier as usize) < PACK_PRICES_FUEL.len(), PdrError::BadParams);
+        let player = &mut ctx.accounts.player;
+        require!(player.pack_credits[tier as usize] > 0, PdrError::NoPackCredit);
+        player.pack_credits[tier as usize] -= 1;
+        Ok(())
+    }
+
+    /// Claim the FUEL reward for a beaten career boss (0..3), once.
+    pub fn claim_career_boss(ctx: Context<ClaimCareerBoss>, boss: u8) -> Result<()> {
+        require!((boss as usize) < BOSS_REWARDS_FUEL.len(), PdrError::BadParams);
+        let player = &mut ctx.accounts.player;
+        let bit = 1u8 << boss;
+        require!(player.career_bosses & bit == 0, PdrError::BossAlreadyClaimed);
+        player.career_bosses |= bit;
+        player.claimable += BOSS_REWARDS_FUEL[boss as usize] * 1_000_000;
+        Ok(())
+    }
+
+    /// Marketplace: list a car NFT for sale, priced in FUEL, SOL or
+    /// SKR (price is in that currency's base units). The NFT moves
+    /// into a listing escrow until it sells or is cancelled.
+    pub fn list_nft(
+        ctx: Context<ListNft>,
+        model: u8,
+        index: u32,
+        price: u64,
+        currency: u8,
+    ) -> Result<()> {
         require!(price > 0, PdrError::BadParams);
         require!((model as usize) < CAR_MODELS, PdrError::BadParams);
+        require!(currency <= CUR_SKR, PdrError::BadParams);
         require!(
             index < ctx.accounts.config.cars_minted[model as usize],
             PdrError::BadParams
@@ -756,6 +993,7 @@ pub mod pixel_drag_racer {
         listing.mint = ctx.accounts.nft_mint.key();
         listing.model = model;
         listing.price = price;
+        listing.currency = currency;
         listing.ts = Clock::get()?.unix_timestamp;
         listing.bump = ctx.bumps.listing;
 
@@ -773,35 +1011,86 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
-    /// Marketplace: buy a listed car NFT. The buyer pays FUEL — the
-    /// 3% marketplace fee is burned, the rest goes to the seller, the
-    /// NFT lands in the buyer's wallet.
+    /// Marketplace: buy a listed car NFT in its listing currency.
+    /// FUEL: 3% fee burned, rest to the seller. SOL/SKR: 3% fee split
+    /// 50/50 season pool / treasury, rest to the seller.
     pub fn buy_nft(ctx: Context<BuyNft>) -> Result<()> {
         let price = ctx.accounts.listing.price;
+        let currency = ctx.accounts.listing.currency;
         let fee = price * MARKET_FEE_BPS / 10_000;
+        let net = price - fee;
 
-        token::burn(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Burn {
-                    mint: ctx.accounts.fuel_mint.to_account_info(),
-                    from: ctx.accounts.buyer_fuel_ata.to_account_info(),
-                    authority: ctx.accounts.buyer.to_account_info(),
-                },
-            ),
-            fee,
-        )?;
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.buyer_fuel_ata.to_account_info(),
-                    to: ctx.accounts.seller_fuel_ata.to_account_info(),
-                    authority: ctx.accounts.buyer.to_account_info(),
-                },
-            ),
-            price - fee,
-        )?;
+        match currency {
+            CUR_FUEL => {
+                let buyer_ata = ctx.accounts.buyer_fuel_ata.as_ref().ok_or(PdrError::BadParams)?;
+                let seller_ata = ctx.accounts.seller_fuel_ata.as_ref().ok_or(PdrError::BadParams)?;
+                token::burn(
+                    CpiContext::new(
+                        ctx.accounts.token_program.to_account_info(),
+                        Burn {
+                            mint: ctx.accounts.fuel_mint.to_account_info(),
+                            from: buyer_ata.to_account_info(),
+                            authority: ctx.accounts.buyer.to_account_info(),
+                        },
+                    ),
+                    fee,
+                )?;
+                token::transfer(
+                    CpiContext::new(
+                        ctx.accounts.token_program.to_account_info(),
+                        Transfer {
+                            from: buyer_ata.to_account_info(),
+                            to: seller_ata.to_account_info(),
+                            authority: ctx.accounts.buyer.to_account_info(),
+                        },
+                    ),
+                    net,
+                )?;
+            }
+            CUR_SOL => {
+                let half = fee / 2;
+                for (to, amt) in [
+                    (ctx.accounts.sol_pool.to_account_info(), half),
+                    (ctx.accounts.treasury.to_account_info(), fee - half),
+                    (ctx.accounts.seller.to_account_info(), net),
+                ] {
+                    system_program::transfer(
+                        CpiContext::new(
+                            ctx.accounts.system_program.to_account_info(),
+                            system_program::Transfer {
+                                from: ctx.accounts.buyer.to_account_info(),
+                                to,
+                            },
+                        ),
+                        amt,
+                    )?;
+                }
+            }
+            CUR_SKR => {
+                let buyer_ata = ctx.accounts.buyer_skr_ata.as_ref().ok_or(PdrError::BadParams)?;
+                let seller_ata = ctx.accounts.seller_skr_ata.as_ref().ok_or(PdrError::BadParams)?;
+                let tre_ata = ctx.accounts.treasury_skr_ata.as_ref().ok_or(PdrError::BadParams)?;
+                let half = fee / 2;
+                for (to, amt) in [
+                    (ctx.accounts.skr_pool.to_account_info(), half),
+                    (tre_ata.to_account_info(), fee - half),
+                    (seller_ata.to_account_info(), net),
+                ] {
+                    token::transfer(
+                        CpiContext::new(
+                            ctx.accounts.token_program.to_account_info(),
+                            Transfer {
+                                from: buyer_ata.to_account_info(),
+                                to,
+                                authority: ctx.accounts.buyer.to_account_info(),
+                            },
+                        ),
+                        amt,
+                    )?;
+                }
+            }
+            _ => return err!(PdrError::BadParams),
+        }
 
         let mint_key = ctx.accounts.listing.mint;
         let bump = ctx.accounts.listing.bump;
@@ -883,10 +1172,19 @@ pub struct Config {
     pub base_reward: u64,
     pub referral_bps: u16,
     pub cars_minted: [u32; CAR_MODELS],
+    // multi-currency economy
+    pub skr_mint: Pubkey,
+    pub treasury: Pubkey,
+    pub sol_rate: u64,        // lamports per 1 whole FUEL
+    pub skr_rate: u64,        // SKR base units per 1 whole FUEL
+    pub skr_discount_bps: u16, // paying in SKR is this much cheaper
+    pub committed_sol: u64,   // season-pool lamports already promised
+    pub committed_skr: u64,   // season-pool SKR already promised
     pub bump: u8,
 }
 impl Config {
-    pub const SIZE: usize = 8 + 32 + 32 + 2 + 8 + 8 + 8 + 2 + 4 * CAR_MODELS + 1;
+    pub const SIZE: usize =
+        8 + 32 + 32 + 2 + 8 + 8 + 8 + 2 + 4 * CAR_MODELS + 32 + 32 + 8 + 8 + 2 + 8 + 8 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq)]
@@ -929,10 +1227,15 @@ pub struct Player {
     pub referral_earned: u64,
     pub rp: u16,
     pub active_match: Pubkey,
+    // multi-currency claims + shop credits
+    pub claimable_sol: u64,
+    pub claimable_skr: u64,
+    pub pack_credits: [u16; 3],
+    pub career_bosses: u8, // claim bitmask for the 4 career bosses
     pub bump: u8,
 }
 impl Player {
-    pub const SIZE: usize = 8 + 32 + 33 + 2 + 4 + 4 + 8 + 4 + 8 + 2 + 32 + 1;
+    pub const SIZE: usize = 8 + 32 + 33 + 2 + 4 + 4 + 8 + 4 + 8 + 2 + 32 + 8 + 8 + 6 + 1 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq)]
@@ -1013,9 +1316,30 @@ pub struct Initialize<'info> {
         bump
     )]
     pub board: Account<'info, SeasonBoard>,
+    /// the external SKR mint accepted as payment
+    pub skr_mint: Account<'info, Mint>,
+    /// CHECK: revenue wallet chosen by the admin
+    pub treasury: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = admin,
+        token::mint = skr_mint,
+        token::authority = config,
+        seeds = [b"skrpool"],
+        bump
+    )]
+    pub skr_pool: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct SetRates<'info> {
+    #[account(address = config.admin @ PdrError::NotYourProfile)]
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
 }
 
 #[derive(Accounts)]
@@ -1071,6 +1395,10 @@ pub struct EndSeason<'info> {
         bump
     )]
     pub board: Account<'info, SeasonBoard>,
+    #[account(seeds = [b"solpool"], bump)]
+    pub sol_pool: SystemAccount<'info>,
+    #[account(seeds = [b"skrpool"], bump)]
+    pub skr_pool: Account<'info, TokenAccount>,
     // remaining_accounts: the 16 Player PDAs in board order
 }
 
@@ -1078,10 +1406,12 @@ pub struct EndSeason<'info> {
 pub struct Claim<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
-    #[account(seeds = [b"config"], bump = config.bump)]
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(mut, address = config.mint)]
     pub mint: Account<'info, Mint>,
+    #[account(address = config.skr_mint)]
+    pub skr_mint: Account<'info, Mint>,
     #[account(
         mut,
         seeds = [b"player", authority.key().as_ref()],
@@ -1095,6 +1425,17 @@ pub struct Claim<'info> {
         associated_token::authority = authority
     )]
     pub player_ata: Account<'info, TokenAccount>,
+    #[account(mut, seeds = [b"solpool"], bump)]
+    pub sol_pool: SystemAccount<'info>,
+    #[account(mut, seeds = [b"skrpool"], bump)]
+    pub skr_pool: Account<'info, TokenAccount>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        associated_token::mint = skr_mint,
+        associated_token::authority = authority
+    )]
+    pub player_skr_ata: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -1133,17 +1474,71 @@ pub struct CreateDuel<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
+#[derive(Accounts)]
+pub struct BuyPack<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, address = config.mint)]
+    pub fuel_mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        seeds = [b"player", buyer.key().as_ref()],
+        bump = player.bump
+    )]
+    pub player: Account<'info, Player>,
+    #[account(mut, constraint = buyer_fuel_ata.owner == buyer.key() @ PdrError::WrongAta)]
+    pub buyer_fuel_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"solpool"], bump)]
+    pub sol_pool: SystemAccount<'info>,
+    /// CHECK: revenue wallet fixed in the config
+    #[account(mut, address = config.treasury)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"skrpool"], bump)]
+    pub skr_pool: Account<'info, TokenAccount>,
+    #[account(mut, constraint = buyer_skr_ata.owner == buyer.key() && buyer_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub buyer_skr_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, constraint = treasury_skr_ata.owner == config.treasury && treasury_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub treasury_skr_ata: Option<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OpenPack<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"player", authority.key().as_ref()],
+        bump = player.bump
+    )]
+    pub player: Account<'info, Player>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimCareerBoss<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"player", authority.key().as_ref()],
+        bump = player.bump
+    )]
+    pub player: Account<'info, Player>,
+}
+
 #[account]
 pub struct Listing {
     pub seller: Pubkey,
     pub mint: Pubkey,
     pub model: u8,
     pub price: u64,
+    pub currency: u8,
     pub ts: i64,
     pub bump: u8,
 }
 impl Listing {
-    pub const SIZE: usize = 8 + 32 + 32 + 1 + 8 + 8 + 1;
+    pub const SIZE: usize = 8 + 32 + 32 + 1 + 8 + 1 + 8 + 1;
 }
 
 #[derive(Accounts)]
@@ -1205,9 +1600,22 @@ pub struct BuyNft<'info> {
     #[account(mut, seeds = [b"lvault", listing.mint.as_ref()], bump)]
     pub lvault: Account<'info, TokenAccount>,
     #[account(mut, constraint = buyer_fuel_ata.owner == buyer.key() @ PdrError::WrongAta)]
-    pub buyer_fuel_ata: Account<'info, TokenAccount>,
+    pub buyer_fuel_ata: Option<Account<'info, TokenAccount>>,
     #[account(mut, constraint = seller_fuel_ata.owner == listing.seller @ PdrError::WrongAta)]
-    pub seller_fuel_ata: Account<'info, TokenAccount>,
+    pub seller_fuel_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"solpool"], bump)]
+    pub sol_pool: SystemAccount<'info>,
+    /// CHECK: revenue wallet fixed in the config
+    #[account(mut, address = config.treasury)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"skrpool"], bump)]
+    pub skr_pool: Account<'info, TokenAccount>,
+    #[account(mut, constraint = buyer_skr_ata.owner == buyer.key() && buyer_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub buyer_skr_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, constraint = seller_skr_ata.owner == listing.seller && seller_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub seller_skr_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, constraint = treasury_skr_ata.owner == config.treasury && treasury_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub treasury_skr_ata: Option<Account<'info, TokenAccount>>,
     #[account(
         init_if_needed,
         payer = buyer,
@@ -1376,7 +1784,18 @@ pub struct MintCar<'info> {
     #[account(mut, address = config.mint)]
     pub fuel_mint: Account<'info, Mint>,
     #[account(mut, constraint = buyer_fuel_ata.owner == buyer.key() @ PdrError::WrongAta)]
-    pub buyer_fuel_ata: Account<'info, TokenAccount>,
+    pub buyer_fuel_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [b"solpool"], bump)]
+    pub sol_pool: SystemAccount<'info>,
+    /// CHECK: revenue wallet fixed in the config
+    #[account(mut, address = config.treasury)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [b"skrpool"], bump)]
+    pub skr_pool: Account<'info, TokenAccount>,
+    #[account(mut, constraint = buyer_skr_ata.owner == buyer.key() && buyer_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub buyer_skr_ata: Option<Account<'info, TokenAccount>>,
+    #[account(mut, constraint = treasury_skr_ata.owner == config.treasury && treasury_skr_ata.mint == config.skr_mint @ PdrError::WrongAta)]
+    pub treasury_skr_ata: Option<Account<'info, TokenAccount>>,
     #[account(
         init,
         payer = buyer,
@@ -1522,4 +1941,10 @@ pub enum PdrError {
     OutOfBand,
     #[msg("finish your active match first")]
     InMatch,
+    #[msg("exchange rates not set")]
+    RatesNotSet,
+    #[msg("no pack credit of this tier")]
+    NoPackCredit,
+    #[msg("boss reward already claimed")]
+    BossAlreadyClaimed,
 }

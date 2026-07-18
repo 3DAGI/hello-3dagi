@@ -12,7 +12,11 @@ import {
   mintCarNft, getOwnedCarNfts, getListings, listNftIx, buyNftIx, cancelListingIx,
   getQueue, getMatch, enterRankedQueue, leaveRankedQueue,
   submitRankedTimeIx, settleRankedIx, RANKED_STAKE,
+  buyPackOnChain, openPackOnChain, claimCareerBoss,
+  getSolBalance, getSkrBalance, fmtPrice,
+  CUR_FUEL, CUR_SOL, CUR_SKR, CUR_NAMES,
   DUEL_STAKES, FUEL_DECIMALS, CAR_PRICES_FUEL, CAR_MODELS,
+  PACK_PRICES_FUEL, BOSS_REWARDS_FUEL,
 } from './chain.js';
 import { sendIxs } from './solana.js';
 import { PublicKey } from '@solana/web3.js';
@@ -155,10 +159,12 @@ const PACKS = [
   { name: 'ELITE PACK', price: 20000, color: '#ff5c7a', desc: '20% PREMIUM CAR · PITY 5' },
 ];
 
-function openPack(tier) {
+function openPack(tier, viaCredit) {
   const pack = PACKS[tier];
-  if (G.cash < pack.price) { setFlash('NOT ENOUGH CASH', PAL.red); return; }
-  G.cash -= pack.price;
+  if (!viaCredit) {
+    if (G.cash < pack.price) { setFlash('NOT ENOUGH CASH', PAL.red); return; }
+    G.cash -= pack.price;
+  }
   const r = Math.random();
   const premiumLeft = ['wolf', 'bullet'].filter(id => !G.owned.includes(id));
   const carChance = tier === 0 ? 0.03 : tier === 1 ? 0.10 : 0.20;
@@ -413,6 +419,8 @@ const G = {
   nftInstances: [],      // [{model,index,mint}] held in wallet
   listings: [],          // open marketplace listings
   listPriceIdx: 1,
+  payCur: 0,             // selected payment currency (FUEL/SOL/SKR)
+  solBal: 0, skrBal: 0,
   // ranked mode (persisted)
   rp: 0, rankedW: 0, rankedL: 0, rankedMonth: '',
   rankedOpp: null,       // matched opponent {name, et, rp, car}
@@ -745,7 +753,11 @@ function tapAnywhere(x, y, isKey) {
     case 'marketbuy': doMarketBuy(h.idx); break;
     case 'marketcancel': doMarketCancel(h.idx); break;
     case 'marketlist': doMarketList(); break;
-    case 'marketprice': G.listPriceIdx = (G.listPriceIdx + 1) % LIST_PRICES.length; break;
+    case 'marketprice': G.listPriceIdx = (G.listPriceIdx + 1) % LIST_PRICE_SETS[G.payCur].length; break;
+    case 'paycur': G.payCur = (G.payCur + 1) % 3; break;
+    case 'chainpack': doChainPack(h.idx); break;
+    case 'openchainpack': doOpenChainPack(h.idx); break;
+    case 'claimboss': doClaimBoss(h.idx); break;
     case 'tunefd': adjustTune('fd', h.idx); break;
     case 'tunenos': adjustTune('nos', h.idx); break;
     case 'rankedsearch':
@@ -816,14 +828,25 @@ async function doChainSettle() {
 // ------------------------------------------------------------
 // Marketplace actions (buy/list/cancel car NFTs, fee burned)
 // ------------------------------------------------------------
-const LIST_PRICES = [1000, 5000, 10000, 25000, 50000, 100000]; // FUEL
+// listing price presets per currency (whole FUEL / SOL / whole SKR)
+const LIST_PRICE_SETS = [
+  [1000, 5000, 10000, 25000, 50000, 100000],
+  [0.05, 0.1, 0.25, 0.5, 1, 2],
+  [50, 100, 250, 500, 1000, 2500],
+];
+const LIST_PRICE_UNITS = [1e6, 1e9, 1e6]; // FUEL 6dp, SOL lamports, SKR 6dp
+
+function fmtListPrice(l) {
+  const v = l.price / LIST_PRICE_UNITS[l.currency || 0];
+  return (l.currency === CUR_SOL ? v.toFixed(2) : v.toFixed(0)) + ' ' + CUR_NAMES[l.currency || 0];
+}
 
 async function doMarketBuy(idx) {
   const listing = G.listings[idx];
-  if (!listing || sol.busy) return;
+  if (!listing || sol.busy || !G.chainCfg) return;
   if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
   setFlash('SIGNING TX...', PAL.nos);
-  const sig = await sendIxs([buyNftIx(getPublicKey(), listing)]);
+  const sig = await sendIxs([buyNftIx(getPublicKey(), listing, G.chainCfg)]);
   setFlash(sig ? 'NFT BOUGHT - CAR UNLOCKED!' : sol.error, sig ? PAL.green : PAL.red);
   if (sig) refreshChain(true);
 }
@@ -834,8 +857,37 @@ async function doMarketList() {
   if (!nft || sol.busy) return;
   if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
   setFlash('SIGNING TX...', PAL.nos);
-  const sig = await sendIxs([listNftIx(getPublicKey(), nft.model, nft.index, LIST_PRICES[G.listPriceIdx])]);
+  const priceUnits = LIST_PRICE_SETS[G.payCur][G.listPriceIdx] * LIST_PRICE_UNITS[G.payCur];
+  const sig = await sendIxs([listNftIx(getPublicKey(), nft.model, nft.index, priceUnits, G.payCur)]);
   setFlash(sig ? 'LISTED ON THE MARKET!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+// on-chain pack purchase / opening + career boss claims
+async function doChainPack(tier) {
+  if (sol.busy) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await buyPackOnChain(tier, G.payCur);
+  setFlash(sig ? 'PACK CREDIT BOUGHT!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+async function doOpenChainPack(tier) {
+  if (sol.busy) return;
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await openPackOnChain(tier);
+  if (!sig) { setFlash(sol.error, PAL.red); return; }
+  openPack(tier, true); // grant the contents locally, no cash cost
+  refreshChain(true);
+}
+
+async function doClaimBoss(boss) {
+  if (sol.busy) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await claimCareerBoss(boss);
+  setFlash(sig ? '+' + BOSS_REWARDS_FUEL[boss] + ' FUEL CLAIMABLE!' : sol.error, sig ? PAL.green : PAL.red);
   if (sig) refreshChain(true);
 }
 
@@ -852,7 +904,7 @@ async function doMintCarNft() {
   const model = G.dealerIdx;
   if (!sol.connected) { const ok = await connectWallet(); if (!ok) { setFlash(sol.error, PAL.red); return; } }
   setFlash('SIGNING MINT TX...', PAL.nos);
-  const sig = await mintCarNft(model);
+  const sig = await mintCarNft(model, G.payCur);
   setFlash(sig ? 'CAR NFT MINTED!' : sol.error, sig ? PAL.green : PAL.red);
   if (sig) refreshChain(true);
 }
@@ -889,6 +941,8 @@ async function refreshChain(force) {
       G.nftInstances = await getOwnedCarNfts(me, G.chainCfg);
       G.nftModels = [...new Set(G.nftInstances.map(n => n.model))];
       G.listings = await getListings(G.chainCfg);
+      G.solBal = await getSolBalance(me);
+      G.skrBal = await getSkrBalance(me, G.chainCfg);
       // NFTs held in the wallet unlock their car model in-game
       for (const m of G.nftModels) {
         const car = CARS[m];
@@ -2121,7 +2175,32 @@ function drawShop() {
   }
   ctx.fillStyle = PAL.dim;
   pixText('PAINTS', 350, 172, 7);
-  pixTextCenter('DROPS APPLY TO YOUR CURRENT CAR · PAINTS UNLOCK IN THE DEALER', 196, 7);
+
+  // on-chain pack purchases in FUEL / SOL / SKR
+  if (mwaSupported) {
+    const live = !!G.chainCfg;
+    ctx.fillStyle = PAL.nos;
+    pixText('ON-CHAIN:', 24, 194, 8);
+    chainButton(96, 189, 58, 18, CUR_NAMES[G.payCur] + ' >', PAL.cash, 'paycur');
+    const credits = G.chainPlayer ? G.chainPlayer.packCredits : [0, 0, 0];
+    ['S', 'P', 'E'].forEach((tag, i) => {
+      const bx = 164 + i * 78;
+      if (credits[i] > 0) {
+        chainButton(bx, 189, 70, 18, 'OPEN ' + tag + ' (' + credits[i] + ')', PAL.green, 'openchainpack', i);
+      } else if (live) {
+        chainButton(bx, 189, 70, 18, tag + ' ' + fmtPrice(G.chainCfg, PACK_PRICES_FUEL[i], G.payCur), PAL.nos, 'chainpack', i);
+      } else {
+        panel(bx, 189, 70, 18, PAL.border);
+        ctx.fillStyle = PAL.dim;
+        pixTextCenter(tag + ' ' + PACK_PRICES_FUEL[i] + 'F', 194, 7, bx + 35);
+      }
+    });
+    ctx.fillStyle = PAL.dim;
+    pixText(live ? 'SKR PAYS ' + (G.chainCfg.skrDiscountBps / 100) + '% LESS' : 'PROGRAM NOT LIVE YET', 410, 194, 6);
+  } else {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('DROPS APPLY TO YOUR CURRENT CAR · PAINTS UNLOCK IN THE DEALER', 196, 7);
+  }
 
   backButton();
 
@@ -2280,6 +2359,13 @@ function drawCareer() {
     pixTextCenter('YOU BEAT EVERY RIVAL ON THE STRIP', 120, 10);
     ctx.fillStyle = PAL.dim;
     pixTextCenter('QUICK RACE STAYS OPEN FOR GRINDING', 145, 8);
+    if (mwaSupported) {
+      const mask = G.chainPlayer ? G.chainPlayer.careerBosses : 0;
+      const claimIdx = [0, 1, 2, 3].find(i => !(mask & (1 << i)));
+      if (claimIdx !== undefined) {
+        chainButton(150, 170, 180, 24, sol.busy ? '...' : 'CLAIM BOSS +' + BOSS_REWARDS_FUEL[claimIdx] + ' FUEL', PAL.cash, 'claimboss', claimIdx);
+      }
+    }
     backButton();
     drawHUDFlash();
     return;
@@ -2319,6 +2405,16 @@ function drawCareer() {
   pixText('YOUR CAR: ' + S.car.name, 76, 140, 8);
   const best = G.best[G.carId];
   if (best) pixText('YOUR BEST: ' + best.toFixed(2) + 's', 76, 154, 8);
+
+  // beaten bosses pay FUEL on-chain, once each
+  if (mwaSupported) {
+    const bossStages = [4, 9, 14, 18];
+    const mask = G.chainPlayer ? G.chainPlayer.careerBosses : 0;
+    const claimIdx = bossStages.findIndex((s, i) => G.career > s && !(mask & (1 << i)));
+    if (claimIdx >= 0) {
+      chainButton(76, 166, 180, 15, sol.busy ? '...' : 'CLAIM BOSS +' + BOSS_REWARDS_FUEL[claimIdx] + ' FUEL', PAL.cash, 'claimboss', claimIdx);
+    }
+  }
 
   const bx = 60, by = 196, bw = 360, bh = 30;
   panel(bx, by, bw, bh, PAL.green);
@@ -2556,8 +2652,12 @@ function drawDealer() {
       ctx.fillStyle = live ? PAL.nos : PAL.dim;
       pixTextCenter('MINT NFT', ny + 8, 9, nx + nw / 2);
       ctx.fillStyle = PAL.dim;
-      pixTextCenter(CAR_PRICES_FUEL[G.dealerIdx] + ' FUEL', ny + 22, 7, nx + nw / 2);
+      pixTextCenter(live
+        ? fmtPrice(G.chainCfg, CAR_PRICES_FUEL[G.dealerIdx], G.payCur)
+        : CAR_PRICES_FUEL[G.dealerIdx] + ' FUEL', ny + 22, 7, nx + nw / 2);
       if (live) hits.push({ x: nx, y: ny, w: nw, h: nh, action: 'mintnft' });
+      // payment currency toggle (SKR pays less — ecosystem discount)
+      chainButton(nx + nw + 8, ny + 8, 62, 24, CUR_NAMES[G.payCur] + ' >', PAL.cash, 'paycur');
     }
   }
 
@@ -2672,8 +2772,14 @@ function drawChainWallet() {
     ctx.fillStyle = PAL.dim;
     pixText('NOT REGISTERED YET - SUBMIT A TIME TO START', 24, 128, 8);
   }
-  if (claimable > 0) {
-    chainButton(280, 96, 186, 30, sol.busy ? 'SIGNING...' : 'CLAIM $FUEL', PAL.cash, 'claimfuel');
+  // multi-currency balances + pending season prizes
+  ctx.fillStyle = PAL.dim;
+  const pendSol = p ? p.claimableSol / 1e9 : 0;
+  const pendSkr = p ? p.claimableSkr / 1e6 : 0;
+  pixText('SOL ' + G.solBal.toFixed(3) + (pendSol > 0 ? ' (+' + pendSol.toFixed(3) + ')' : '') +
+    ' · SKR ' + G.skrBal.toFixed(1) + (pendSkr > 0 ? ' (+' + pendSkr.toFixed(1) + ')' : ''), 24, 142, 8);
+  if (claimable > 0 || pendSol > 0 || pendSkr > 0) {
+    chainButton(280, 96, 186, 30, sol.busy ? 'SIGNING...' : 'CLAIM ALL', PAL.cash, 'claimfuel');
   }
   if (sol.lastSig) {
     ctx.fillStyle = PAL.dim;
@@ -2813,8 +2919,8 @@ function drawChainMarket() {
     const car = CARS[l.model];
     ctx.fillStyle = mine ? PAL.green : PAL.text;
     pixText((car ? car.name : '?') + ' #' + (l.index + 1), 24, y, 8);
-    ctx.fillStyle = PAL.cash;
-    pixText((l.price / 10 ** FUEL_DECIMALS).toFixed(0) + ' FUEL', 160, y, 8);
+    ctx.fillStyle = [PAL.cash, '#8ce8e0', PAL.nos][l.currency || 0];
+    pixText(fmtListPrice(l), 160, y, 8);
     ctx.fillStyle = PAL.dim;
     pixText(mine ? 'YOU' : l.seller.toBase58().slice(0, 4) + '..', 246, y, 8);
     if (mine) {
@@ -2831,8 +2937,10 @@ function drawChainMarket() {
     const car = CARS[unlisted.model];
     ctx.fillStyle = PAL.dim;
     pixText('SELL: ' + (car ? car.name : '?') + ' #' + (unlisted.index + 1), 24, 166, 8);
-    chainButton(200, 160, 110, 20, LIST_PRICES[G.listPriceIdx] + ' FUEL >', PAL.cash, 'marketprice');
-    chainButton(320, 160, 110, 20, sol.busy ? '...' : 'LIST IT', PAL.green, 'marketlist');
+    chainButton(180, 160, 54, 20, CUR_NAMES[G.payCur], PAL.cash, 'paycur');
+    const priceIdx = Math.min(G.listPriceIdx, LIST_PRICE_SETS[G.payCur].length - 1);
+    chainButton(240, 160, 90, 20, LIST_PRICE_SETS[G.payCur][priceIdx] + ' >', PAL.cash, 'marketprice');
+    chainButton(340, 160, 100, 20, sol.busy ? '...' : 'LIST IT', PAL.green, 'marketlist');
   } else if (sol.connected) {
     ctx.fillStyle = PAL.dim;
     pixText('NO UNLISTED CAR NFTS IN YOUR WALLET', 24, 166, 8);
