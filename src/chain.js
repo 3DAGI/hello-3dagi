@@ -24,6 +24,9 @@ export const CAR_PRICES_FUEL = [2000, 6500, 18000, 42000, 110000]; // whole FUEL
 // sha256("global:<ix>")[0..8] / sha256("account:<name>")[0..8]
 const IX = {
   mintCar: [125, 246, 210, 195, 91, 198, 69, 131],
+  listNft: [88, 221, 93, 166, 63, 220, 106, 232],
+  buyNft: [96, 0, 28, 190, 49, 107, 83, 222],
+  cancelListing: [41, 183, 50, 232, 230, 233, 157, 70],
   queueJoin: [92, 200, 67, 181, 226, 164, 189, 56],
   queueMatch: [251, 238, 110, 237, 158, 151, 221, 12],
   queueLeave: [52, 192, 93, 86, 59, 56, 237, 42],
@@ -55,6 +58,8 @@ export const queuePda = () => pda([enc.encode('queue')]);
 export const qvaultPda = () => pda([enc.encode('qvault')]);
 export const matchPda = (a, b) => pda([enc.encode('match'), a.toBytes(), b.toBytes()]);
 export const mvaultPda = (m) => pda([enc.encode('mvault'), m.toBytes()]);
+export const listingPda = (mint) => pda([enc.encode('listing'), mint.toBytes()]);
+export const lvaultPda = (mint) => pda([enc.encode('lvault'), mint.toBytes()]);
 export const boardPda = (season) => pda([enc.encode('season'), u16le(season)]);
 export const playerPda = (wallet) => pda([enc.encode('player'), wallet.toBytes()]);
 export const duelPda = (creator, seed) => pda([enc.encode('duel'), creator.toBytes(), u32le(seed)]);
@@ -358,17 +363,18 @@ export function mintCarIx(buyer, model, index) {
   ]);
 }
 
-// Which car models does this wallet hold as NFTs? Enumerates the
-// program's car mints (bounded by carsMinted) and checks the owner's
-// ATAs in batches — no indexer/DAS needed.
-export async function getOwnedCarModels(owner, cfg) {
-  const models = new Set();
+// Which car NFTs does this wallet hold? Enumerates the program's car
+// mints (bounded by carsMinted) and checks the owner's ATAs in
+// batches — no indexer/DAS needed. Returns [{model, index, mint}].
+export async function getOwnedCarNfts(owner, cfg) {
+  const out = [];
   const connection = getConnection();
   const checks = [];
   for (let model = 0; model < CAR_MODELS; model++) {
     const count = Math.min(cfg.carsMinted[model] || 0, 64);
     for (let i = 0; i < count; i++) {
-      checks.push({ model, ata: ataFor(owner, carMintPda(model, i)) });
+      const mint = carMintPda(model, i);
+      checks.push({ model, index: i, mint, ata: ataFor(owner, mint) });
     }
   }
   for (let o = 0; o < checks.length; o += 100) {
@@ -379,10 +385,90 @@ export async function getOwnedCarModels(owner, cfg) {
       const amount = new DataView(
         info.data.buffer, info.data.byteOffset + 64, 8
       ).getBigUint64(0, true);
-      if (amount >= 1n) models.add(slice[j].model);
+      if (amount >= 1n) out.push({ model: slice[j].model, index: slice[j].index, mint: slice[j].mint });
     });
   }
-  return [...models];
+  return out;
+}
+
+export async function getOwnedCarModels(owner, cfg) {
+  return [...new Set((await getOwnedCarNfts(owner, cfg)).map(n => n.model))];
+}
+
+// All open marketplace listings, found by scanning the bounded car
+// mint space for listing PDAs.
+export async function getListings(cfg) {
+  const connection = getConnection();
+  const mints = [];
+  for (let model = 0; model < CAR_MODELS; model++) {
+    const count = Math.min(cfg.carsMinted[model] || 0, 64);
+    for (let i = 0; i < count; i++) mints.push({ model, index: i, mint: carMintPda(model, i) });
+  }
+  const out = [];
+  for (let o = 0; o < mints.length; o += 100) {
+    const slice = mints.slice(o, o + 100);
+    const infos = await connection.getMultipleAccountsInfo(slice.map(m => listingPda(m.mint)));
+    infos.forEach((info, j) => {
+      if (!info) return;
+      const r = new Reader(new Uint8Array(info.data));
+      r.skip(8);
+      out.push({
+        seller: r.pubkey(),
+        mint: r.pubkey(),
+        model: r.u8(),
+        price: r.u64(),
+        ts: r.i64(),
+        index: slice[j].index,
+      });
+    });
+  }
+  out.sort((a, b) => a.price - b.price);
+  return out;
+}
+
+export function listNftIx(seller, model, index, priceFuel) {
+  const mint = carMintPda(model, index);
+  const price = BigInt(Math.round(priceFuel * 10 ** FUEL_DECIMALS));
+  return ix(IX.listNft, cat(new Uint8Array([model]), u32le(index), u64le(price)), [
+    k(seller, true, true),
+    k(configPda()),
+    k(mint),
+    k(listingPda(mint), true),
+    k(lvaultPda(mint), true),
+    k(ataFor(seller, mint), true),
+    k(TOKEN_PROGRAM_ID),
+    k(SystemProgram.programId),
+    k(SYSVAR_RENT_PUBKEY),
+  ]);
+}
+
+export function buyNftIx(buyer, listing) {
+  const fuel = fuelMintPda();
+  return ix(IX.buyNft, new Uint8Array(0), [
+    k(buyer, true, true),
+    k(configPda()),
+    k(fuel, true),
+    k(listingPda(listing.mint), true),
+    k(listing.seller, true),
+    k(listing.mint),
+    k(lvaultPda(listing.mint), true),
+    k(ataFor(buyer, fuel), true),
+    k(ataFor(listing.seller, fuel), true),
+    k(ataFor(buyer, listing.mint), true),
+    k(TOKEN_PROGRAM_ID),
+    k(ASSOCIATED_TOKEN_PROGRAM_ID),
+    k(SystemProgram.programId),
+  ]);
+}
+
+export function cancelListingIx(seller, mint) {
+  return ix(IX.cancelListing, new Uint8Array(0), [
+    k(seller, true, true),
+    k(listingPda(mint), true),
+    k(lvaultPda(mint), true),
+    k(ataFor(seller, mint), true),
+    k(TOKEN_PROGRAM_ID),
+  ]);
 }
 
 // ------------------------------------------------------------

@@ -24,7 +24,25 @@ players pay their own claim fee, keeping spam low.
 |---|---|
 | PvP duel rake | 3% of every pot, burned at settle |
 | Ranked match rake | 3% of every ranked pot (50 FUEL stakes), burned at settle |
+| **NFT marketplace fee** | 3% of every player-to-player sale, burned at purchase |
 | **Car NFT mints** | 100% of the mint price burned (2,000–110,000 FUEL per model) |
+
+## In-game NFT marketplace
+
+Players trade their car NFTs directly in the game (`list_nft` / `buy_nft` /
+`cancel_listing`): the NFT sits in a program escrow while listed, prices are in
+FUEL, and 3% of every sale is burned — the seller receives the rest. Listings
+are enumerable on-chain (PDA per mint), so the market view needs no indexer.
+External marketplaces (Tensor/Magic Eden) still work in parallel via the 5%
+metadata royalty.
+
+## Shop packs (soft-currency sink)
+
+Packs are priced in in-game cash (not FUEL) and act as the cash sink: Street
+$2,500 / Pro $8,000 / Elite $20,000 with weighted drops — cash, free upgrade
+stages, 4 exclusive paints, and the two pack-only premium cars (NIGHT WOLF,
+GOLDEN BULLET; 3/10/20% chance, Elite pity at 5). A FUEL-priced pack tier with
+on-chain burn is a natural v2 once the economy is live.
 
 Planned sinks (roadmap): premium car skins for FUEL (100% burn), season entry
 fees for a pro league, upgrade respec.

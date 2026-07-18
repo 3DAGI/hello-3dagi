@@ -35,6 +35,9 @@ pub const RANK_MULT: [u64; BOARD_SIZE] = [
     500, 300, 200, 100, 100, 100, 100, 100, 50, 50, 50, 50, 50, 50, 50, 50,
 ];
 
+// In-game NFT marketplace
+pub const MARKET_FEE_BPS: u64 = 300; // 3% of every sale, burned
+
 // Ranked on-chain queue
 pub const QUEUE_SIZE: usize = 8;
 pub const RANKED_START_RP: u16 = 300;
@@ -739,6 +742,105 @@ pub mod pixel_drag_racer {
         Ok(())
     }
 
+    /// Marketplace: list a car NFT for sale (priced in FUEL). The NFT
+    /// moves into a listing escrow until it sells or is cancelled.
+    pub fn list_nft(ctx: Context<ListNft>, model: u8, index: u32, price: u64) -> Result<()> {
+        require!(price > 0, PdrError::BadParams);
+        require!((model as usize) < CAR_MODELS, PdrError::BadParams);
+        require!(
+            index < ctx.accounts.config.cars_minted[model as usize],
+            PdrError::BadParams
+        );
+        let listing = &mut ctx.accounts.listing;
+        listing.seller = ctx.accounts.seller.key();
+        listing.mint = ctx.accounts.nft_mint.key();
+        listing.model = model;
+        listing.price = price;
+        listing.ts = Clock::get()?.unix_timestamp;
+        listing.bump = ctx.bumps.listing;
+
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.seller_nft_ata.to_account_info(),
+                    to: ctx.accounts.lvault.to_account_info(),
+                    authority: ctx.accounts.seller.to_account_info(),
+                },
+            ),
+            1,
+        )?;
+        Ok(())
+    }
+
+    /// Marketplace: buy a listed car NFT. The buyer pays FUEL — the
+    /// 3% marketplace fee is burned, the rest goes to the seller, the
+    /// NFT lands in the buyer's wallet.
+    pub fn buy_nft(ctx: Context<BuyNft>) -> Result<()> {
+        let price = ctx.accounts.listing.price;
+        let fee = price * MARKET_FEE_BPS / 10_000;
+
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.fuel_mint.to_account_info(),
+                    from: ctx.accounts.buyer_fuel_ata.to_account_info(),
+                    authority: ctx.accounts.buyer.to_account_info(),
+                },
+            ),
+            fee,
+        )?;
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.buyer_fuel_ata.to_account_info(),
+                    to: ctx.accounts.seller_fuel_ata.to_account_info(),
+                    authority: ctx.accounts.buyer.to_account_info(),
+                },
+            ),
+            price - fee,
+        )?;
+
+        let mint_key = ctx.accounts.listing.mint;
+        let bump = ctx.accounts.listing.bump;
+        let seeds: &[&[u8]] = &[b"listing", mint_key.as_ref(), &[bump]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.lvault.to_account_info(),
+                    to: ctx.accounts.buyer_nft_ata.to_account_info(),
+                    authority: ctx.accounts.listing.to_account_info(),
+                },
+                &[seeds],
+            ),
+            1,
+        )?;
+        Ok(())
+    }
+
+    /// Marketplace: cancel your own listing, NFT comes back.
+    pub fn cancel_listing(ctx: Context<CancelListing>) -> Result<()> {
+        let mint_key = ctx.accounts.listing.mint;
+        let bump = ctx.accounts.listing.bump;
+        let seeds: &[&[u8]] = &[b"listing", mint_key.as_ref(), &[bump]];
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.lvault.to_account_info(),
+                    to: ctx.accounts.seller_nft_ata.to_account_info(),
+                    authority: ctx.accounts.listing.to_account_info(),
+                },
+                &[seeds],
+            ),
+            1,
+        )?;
+        Ok(())
+    }
+
     /// Creator can reclaim the stake if nobody joined before the deadline.
     pub fn cancel_duel(ctx: Context<CancelDuel>) -> Result<()> {
         let duel = &ctx.accounts.duel;
@@ -1029,6 +1131,112 @@ pub struct CreateDuel<'info> {
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+#[account]
+pub struct Listing {
+    pub seller: Pubkey,
+    pub mint: Pubkey,
+    pub model: u8,
+    pub price: u64,
+    pub ts: i64,
+    pub bump: u8,
+}
+impl Listing {
+    pub const SIZE: usize = 8 + 32 + 32 + 1 + 8 + 8 + 1;
+}
+
+#[derive(Accounts)]
+#[instruction(model: u8, index: u32)]
+pub struct ListNft<'info> {
+    #[account(mut)]
+    pub seller: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(
+        seeds = [b"carmint".as_ref(), &[model], index.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub nft_mint: Account<'info, Mint>,
+    #[account(
+        init,
+        payer = seller,
+        space = Listing::SIZE,
+        seeds = [b"listing", nft_mint.key().as_ref()],
+        bump
+    )]
+    pub listing: Account<'info, Listing>,
+    #[account(
+        init,
+        payer = seller,
+        token::mint = nft_mint,
+        token::authority = listing,
+        seeds = [b"lvault", nft_mint.key().as_ref()],
+        bump
+    )]
+    pub lvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = seller_nft_ata.owner == seller.key() @ PdrError::WrongAta)]
+    pub seller_nft_ata: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct BuyNft<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut, address = config.mint)]
+    pub fuel_mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        close = seller,
+        seeds = [b"listing", listing.mint.as_ref()],
+        bump = listing.bump
+    )]
+    pub listing: Account<'info, Listing>,
+    /// CHECK: matches listing.seller; receives the listing rent back
+    #[account(mut, address = listing.seller)]
+    pub seller: UncheckedAccount<'info>,
+    #[account(address = listing.mint)]
+    pub nft_mint: Account<'info, Mint>,
+    #[account(mut, seeds = [b"lvault", listing.mint.as_ref()], bump)]
+    pub lvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = buyer_fuel_ata.owner == buyer.key() @ PdrError::WrongAta)]
+    pub buyer_fuel_ata: Account<'info, TokenAccount>,
+    #[account(mut, constraint = seller_fuel_ata.owner == listing.seller @ PdrError::WrongAta)]
+    pub seller_fuel_ata: Account<'info, TokenAccount>,
+    #[account(
+        init_if_needed,
+        payer = buyer,
+        associated_token::mint = nft_mint,
+        associated_token::authority = buyer
+    )]
+    pub buyer_nft_ata: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelListing<'info> {
+    #[account(mut)]
+    pub seller: Signer<'info>,
+    #[account(
+        mut,
+        close = seller,
+        constraint = listing.seller == seller.key() @ PdrError::NotYourProfile,
+        seeds = [b"listing", listing.mint.as_ref()],
+        bump = listing.bump
+    )]
+    pub listing: Account<'info, Listing>,
+    #[account(mut, seeds = [b"lvault", listing.mint.as_ref()], bump)]
+    pub lvault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = seller_nft_ata.owner == seller.key() @ PdrError::WrongAta)]
+    pub seller_nft_ata: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]

@@ -9,10 +9,10 @@ import {
   getConfig, getBoard, getPlayer, getDuel, getFuelBalance,
   submitTimeOnChain, claimFuel, registerWithReferrer,
   createDuelIx, joinDuelIx, submitDuelTimeIx, settleDuelIx, cancelDuelIx,
-  mintCarNft, getOwnedCarModels,
+  mintCarNft, getOwnedCarNfts, getListings, listNftIx, buyNftIx, cancelListingIx,
   getQueue, getMatch, enterRankedQueue, leaveRankedQueue,
   submitRankedTimeIx, settleRankedIx, RANKED_STAKE,
-  DUEL_STAKES, FUEL_DECIMALS, CAR_PRICES_FUEL,
+  DUEL_STAKES, FUEL_DECIMALS, CAR_PRICES_FUEL, CAR_MODELS,
 } from './chain.js';
 import { sendIxs } from './solana.js';
 import { PublicKey } from '@solana/web3.js';
@@ -128,13 +128,101 @@ const CARS = [
     ],
   },
 ];
+// pack-exclusive premium cars (not buyable in the dealer)
+CARS.push({
+  ...CARS[2], id: 'wolf', name: 'NIGHT WOLF', price: 0, packOnly: true, etHint: 11.8,
+  mass: 1180, torque: 360, redline: 8800, limiter: 9400,
+  gears: [3.40, 2.25, 1.70, 1.33, 1.08, 0.90], finalDrive: 3.9,
+  traction: 9600, drag: 0.35, wheelRadius: 0.31,
+  pal: { b: '#23252e', h: '#ff3a3a', d: '#101318', w: '#9fd4ff' },
+});
+CARS.push({
+  ...CARS[3], id: 'bullet', name: 'GOLDEN BULLET', price: 0, packOnly: true, etHint: 10.8,
+  mass: 1260, torque: 500, redline: 8800, limiter: 9400,
+  gears: [3.20, 2.15, 1.65, 1.30, 1.05, 0.86], finalDrive: 3.6,
+  traction: 12500, drag: 0.32, wheelRadius: 0.33,
+  pal: { b: '#f4c542', h: '#181820', d: '#8a6a1a', w: '#aee6ff' },
+});
 const CAR_BY_ID = Object.fromEntries(CARS.map(c => [c.id, c]));
+
+// ------------------------------------------------------------
+// Shop packs — premium cars, free upgrade stages, exclusive paints
+// ------------------------------------------------------------
+const PREMIUM_PAINT_START = 8; // PAINTS[8..] are pack-exclusive
+const PACKS = [
+  { name: 'STREET PACK', price: 2500, color: '#7ec8ff', desc: 'CASH · PART · PAINT' },
+  { name: 'PRO PACK', price: 8000, color: '#ffd166', desc: 'BIGGER DROPS · 10% CAR' },
+  { name: 'ELITE PACK', price: 20000, color: '#ff5c7a', desc: '20% PREMIUM CAR · PITY 5' },
+];
+
+function openPack(tier) {
+  const pack = PACKS[tier];
+  if (G.cash < pack.price) { setFlash('NOT ENOUGH CASH', PAL.red); return; }
+  G.cash -= pack.price;
+  const r = Math.random();
+  const premiumLeft = ['wolf', 'bullet'].filter(id => !G.owned.includes(id));
+  const carChance = tier === 0 ? 0.03 : tier === 1 ? 0.10 : 0.20;
+  let forceCar = false;
+  if (tier === 2) {
+    G.pity++;
+    if (G.pity >= 5) forceCar = true;
+  }
+
+  let result;
+  if ((forceCar || r >= 1 - carChance) && premiumLeft.length) {
+    const id = premiumLeft[Math.floor(Math.random() * premiumLeft.length)];
+    G.owned.push(id);
+    G.garage[id] = freshParts();
+    if (tier === 2) G.pity = 0;
+    result = { label: CAR_BY_ID[id].name, sub: 'PREMIUM CAR UNLOCKED!', color: PAL.cash, car: id };
+  } else if (r < (tier === 0 ? 0.60 : tier === 1 ? 0.40 : 0.30)) {
+    const amt = [1000 + Math.floor(Math.random() * 2000),
+      4000 + Math.floor(Math.random() * 5000),
+      10000 + Math.floor(Math.random() * 10000)][tier];
+    G.cash += amt;
+    result = { label: '$' + amt, sub: 'CASH DROP', color: PAL.green };
+  } else if (r < (tier === 0 ? 0.85 : tier === 1 ? 0.70 : 0.55)) {
+    // free upgrade stage on the current car
+    const open = UPGRADES.filter(u => G.garage[G.carId][u.id] < MAX_LEVEL);
+    if (open.length) {
+      const upg = open[Math.floor(Math.random() * open.length)];
+      const stage = upg.stages[G.garage[G.carId][upg.id]];
+      G.garage[G.carId][upg.id]++;
+      recalcStats();
+      result = { label: stage, sub: 'FREE PART INSTALLED (' + S.car.name + ')', color: PAL.nos };
+    } else {
+      G.cash += 2000;
+      result = { label: '$2000', sub: 'CAR MAXED - CASH INSTEAD', color: PAL.green };
+    }
+  } else {
+    // exclusive paint
+    const locked = [];
+    for (let i = PREMIUM_PAINT_START; i < PAINTS.length; i++) {
+      if (!G.unlockedPaints.includes(i)) locked.push(i);
+    }
+    if (locked.length) {
+      const idx = locked[Math.floor(Math.random() * locked.length)];
+      G.unlockedPaints.push(idx);
+      result = { label: PREMIUM_PAINT_NAMES[idx - PREMIUM_PAINT_START], sub: 'EXCLUSIVE PAINT UNLOCKED', color: PAINTS[idx] };
+    } else {
+      G.cash += 1500;
+      result = { label: '$1500', sub: 'ALL PAINTS OWNED - CASH INSTEAD', color: PAL.green };
+    }
+  }
+  G.packsOpened++;
+  G.packReveal = { ...result, t: 0 };
+  save();
+  buzz([30, 40, 30]);
+}
 
 // opponent cars always render in this rival paint
 const RIVAL_PAL = { b: '#3aa05a', h: '#8ce8a8', d: '#1d5a32', w: '#ffe6ae' };
 
 // paint shop colors (applied to body, shadow derived automatically)
-const PAINTS = ['#e03a3a', '#2a4fd0', '#e0a63a', '#3aa05a', '#9a5cff', '#e8e8f0', '#3a4048', '#ff7a3c'];
+// indices 8+ are pack-exclusive premium paints
+const PAINTS = ['#e03a3a', '#2a4fd0', '#e0a63a', '#3aa05a', '#9a5cff', '#e8e8f0', '#3a4048', '#ff7a3c',
+  '#d8e4ee', '#f4c542', '#7dff3a', '#ff3ad6'];
+const PREMIUM_PAINT_NAMES = ['CHROME', 'GOLD LEAF', 'NEON TOXIC', 'HYPER MAGENTA'];
 
 function shade(hex, f) {
   const n = parseInt(hex.slice(1), 16);
@@ -318,6 +406,13 @@ const G = {
   nftModels: [],         // car models this wallet holds as NFTs
   chainQueue: null,      // ranked queue slots
   chainMatch: null,      // my active on-chain ranked match
+  // shop + marketplace
+  unlockedPaints: [],    // premium paint indices (persisted)
+  pity: 0, packsOpened: 0,
+  packReveal: null,      // {label, sub, color, t}
+  nftInstances: [],      // [{model,index,mint}] held in wallet
+  listings: [],          // open marketplace listings
+  listPriceIdx: 1,
   // ranked mode (persisted)
   rp: 0, rankedW: 0, rankedL: 0, rankedMonth: '',
   rankedOpp: null,       // matched opponent {name, et, rp, car}
@@ -354,6 +449,9 @@ function loadSave() {
       if (s.paint) G.paint = s.paint;
       if (s.tune) G.tune = s.tune;
       if (typeof s.distIdx === 'number') G.distIdx = Math.min(DISTANCES.length - 1, s.distIdx);
+      if (Array.isArray(s.unlockedPaints)) G.unlockedPaints = s.unlockedPaints;
+      if (typeof s.pity === 'number') G.pity = s.pity;
+      if (typeof s.packsOpened === 'number') G.packsOpened = s.packsOpened;
       if (typeof s.rp === 'number') G.rp = s.rp;
       if (typeof s.rankedW === 'number') G.rankedW = s.rankedW;
       if (typeof s.rankedL === 'number') G.rankedL = s.rankedL;
@@ -378,6 +476,7 @@ function save() {
       ghosts: G.ghosts, streak: G.streak, muted: G.muted,
       paint: G.paint, tune: G.tune, distIdx: G.distIdx,
       rp: G.rp, rankedW: G.rankedW, rankedL: G.rankedL, rankedMonth: G.rankedMonth,
+      unlockedPaints: G.unlockedPaints, pity: G.pity, packsOpened: G.packsOpened,
     }));
   } catch {}
 }
@@ -633,10 +732,20 @@ function tapAnywhere(x, y, isKey) {
     case 'quickdist': G.distIdx = h.idx; save(); break;
     case 'paintcycle': {
       const car = CARS[G.dealerIdx];
-      G.paint[car.id] = ((G.paint[car.id] ?? -1) + 1) % PAINTS.length;
+      let idx = G.paint[car.id] ?? -1;
+      // premium paints only cycle in when unlocked from packs
+      do { idx = (idx + 1) % PAINTS.length; }
+      while (idx >= PREMIUM_PAINT_START && !G.unlockedPaints.includes(idx));
+      G.paint[car.id] = idx;
       save();
       break;
     }
+    case 'buypack': openPack(h.idx); break;
+    case 'packclose': G.packReveal = null; break;
+    case 'marketbuy': doMarketBuy(h.idx); break;
+    case 'marketcancel': doMarketCancel(h.idx); break;
+    case 'marketlist': doMarketList(); break;
+    case 'marketprice': G.listPriceIdx = (G.listPriceIdx + 1) % LIST_PRICES.length; break;
     case 'tunefd': adjustTune('fd', h.idx); break;
     case 'tunenos': adjustTune('nos', h.idx); break;
     case 'rankedsearch':
@@ -704,6 +813,41 @@ async function doChainSettle() {
   if (sig) { G.chainMatch = null; refreshChain(true); }
 }
 
+// ------------------------------------------------------------
+// Marketplace actions (buy/list/cancel car NFTs, fee burned)
+// ------------------------------------------------------------
+const LIST_PRICES = [1000, 5000, 10000, 25000, 50000, 100000]; // FUEL
+
+async function doMarketBuy(idx) {
+  const listing = G.listings[idx];
+  if (!listing || sol.busy) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([buyNftIx(getPublicKey(), listing)]);
+  setFlash(sig ? 'NFT BOUGHT - CAR UNLOCKED!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+async function doMarketList() {
+  const mine = G.listings.filter(l => l.seller.toBase58() === sol.address).map(l => l.mint.toBase58());
+  const nft = G.nftInstances.find(n => !mine.includes(n.mint.toBase58()));
+  if (!nft || sol.busy) return;
+  if (!sol.connected) { const ok = await connectWallet(); if (!ok) return; }
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([listNftIx(getPublicKey(), nft.model, nft.index, LIST_PRICES[G.listPriceIdx])]);
+  setFlash(sig ? 'LISTED ON THE MARKET!' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
+async function doMarketCancel(idx) {
+  const listing = G.listings[idx];
+  if (!listing || sol.busy) return;
+  setFlash('SIGNING TX...', PAL.nos);
+  const sig = await sendIxs([cancelListingIx(getPublicKey(), listing.mint)]);
+  setFlash(sig ? 'LISTING CANCELLED' : sol.error, sig ? PAL.green : PAL.red);
+  if (sig) refreshChain(true);
+}
+
 async function doMintCarNft() {
   const model = G.dealerIdx;
   if (!sol.connected) { const ok = await connectWallet(); if (!ok) { setFlash(sol.error, PAL.red); return; } }
@@ -742,7 +886,9 @@ async function refreshChain(force) {
       G.chainQueue = await getQueue();
       G.chainMatch = G.chainPlayer && G.chainPlayer.activeMatch
         ? await getMatch(G.chainPlayer.activeMatch) : null;
-      G.nftModels = await getOwnedCarModels(me, G.chainCfg);
+      G.nftInstances = await getOwnedCarNfts(me, G.chainCfg);
+      G.nftModels = [...new Set(G.nftInstances.map(n => n.model))];
+      G.listings = await getListings(G.chainCfg);
       // NFTs held in the wallet unlock their car model in-game
       for (const m of G.nftModels) {
         const car = CARS[m];
@@ -939,6 +1085,7 @@ function buyPart(idx) {
 
 function dealerAction() {
   const car = CARS[G.dealerIdx];
+  if (car.packOnly && !G.owned.includes(car.id)) { setFlash('ONLY FROM SHOP PACKS', '#ff9a5c'); return; }
   if (G.owned.includes(car.id)) {
     G.carId = car.id;
     recalcStats();
@@ -1835,13 +1982,14 @@ function drawMenu() {
     { label: 'QUICK RACE', idx: 'quick', color: '#7ec8ff' },
     { label: 'GARAGE', idx: 'garage', color: PAL.cash },
     { label: 'DEALER', idx: 'dealer', color: PAL.green },
+    { label: 'SHOP · PACKS', idx: 'shop', color: '#ff9a5c' },
     { label: sol.connected ? 'WALLET ' + sol.shortAddress : 'WALLET', idx: 'wallet', color: PAL.nos },
   ];
   items.forEach((it, i) => {
-    const bx = 24, by = 52 + i * 34, bw = 190, bh = 28;
+    const bx = 24, by = 44 + i * 29, bw = 190, bh = 25;
     panel(bx, by, bw, bh, it.color);
     ctx.fillStyle = it.color;
-    pixText(it.label, bx + 12, by + 9, 11);
+    pixText(it.label, bx + 12, by + 8, 10);
     hits.push({ x: bx, y: by, w: bw, h: bh, action: 'goto', idx: it.idx });
   });
 
@@ -1868,7 +2016,7 @@ function drawMenu() {
   hits.push({ x: sx, y: sy, w: sw, h: sh, action: 'togglesound' });
 
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('3DAGI · v0.8 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
+  pixTextCenter('3DAGI · v0.9 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
   drawHUDFlash();
 }
 
@@ -1917,6 +2065,86 @@ function backButton() {
   ctx.fillStyle = PAL.text;
   pixTextCenter('< BACK', by + 8, 10);
   hits.push({ x: bx, y: by, w: bw, h: bh, action: 'goto', idx: 'menu' });
+}
+
+// ------------------------------------------------------------
+// Shop screen — packs with premium cars, parts and paints
+// ------------------------------------------------------------
+function drawShop() {
+  starBg();
+  hits.length = 0;
+  ctx.fillStyle = PAL.text;
+  pixText('SHOP', 14, 10, 16);
+  ctx.fillStyle = PAL.dim;
+  pixText('PACKS · ' + G.packsOpened + ' OPENED', 90, 15, 8);
+  cashTag();
+
+  PACKS.forEach((p, i) => {
+    const bw = 136, bh = 96, bx = 24 + i * 148, by = 40;
+    const afford = G.cash >= p.price;
+    panel(bx, by, bw, bh, afford ? p.color : PAL.border);
+    ctx.fillStyle = p.color;
+    pixTextCenter(p.name, by + 10, 11, bx + bw / 2);
+    // pack art: little crate
+    ctx.fillStyle = p.color;
+    ctx.fillRect(bx + bw / 2 - 10, by + 28, 20, 14);
+    ctx.fillStyle = '#0d0d18';
+    ctx.fillRect(bx + bw / 2 - 10, by + 33, 20, 3);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter(p.desc, by + 50, 6, bx + bw / 2);
+    ctx.fillStyle = afford ? PAL.cash : PAL.red;
+    pixTextCenter('BUY $' + p.price, by + 66, 10, bx + bw / 2);
+    if (i === 2) {
+      ctx.fillStyle = PAL.dim;
+      pixTextCenter('PITY ' + G.pity + '/5', by + 82, 7, bx + bw / 2);
+    }
+    hits.push({ x: bx, y: by, w: bw, h: bh, action: 'buypack', idx: i });
+  });
+
+  // premium teaser row
+  ctx.fillStyle = PAL.dim;
+  pixText('PACK EXCLUSIVES:', 24, 152, 8);
+  const wolf = CAR_BY_ID.wolf, bullet = CAR_BY_ID.bullet;
+  drawCarSprite(wolf, 170, 168 - carHeight(wolf), G.owned.includes('wolf') ? carPal(wolf) : { b: '#22242c', h: '#33363e', d: '#16181e', w: '#33363e' }, G.time * 8, 1);
+  drawCarSprite(bullet, 250, 168 - carHeight(bullet), G.owned.includes('bullet') ? carPal(bullet) : { b: '#22242c', h: '#33363e', d: '#16181e', w: '#33363e' }, G.time * 8, 1);
+  ctx.fillStyle = G.owned.includes('wolf') ? PAL.green : PAL.dim;
+  pixText('NIGHT WOLF' + (G.owned.includes('wolf') ? ' *' : ''), 150, 172, 7);
+  ctx.fillStyle = G.owned.includes('bullet') ? PAL.green : PAL.dim;
+  pixText('GOLDEN BULLET' + (G.owned.includes('bullet') ? ' *' : ''), 240, 172, 7);
+  // premium paints
+  for (let i = PREMIUM_PAINT_START; i < PAINTS.length; i++) {
+    const owned = G.unlockedPaints.includes(i);
+    ctx.fillStyle = owned ? PAINTS[i] : '#22242c';
+    ctx.fillRect(350 + (i - PREMIUM_PAINT_START) * 22, 152, 16, 16);
+    ctx.strokeStyle = owned ? PAINTS[i] : PAL.border;
+    ctx.strokeRect(350.5 + (i - PREMIUM_PAINT_START) * 22, 152.5, 15, 15);
+  }
+  ctx.fillStyle = PAL.dim;
+  pixText('PAINTS', 350, 172, 7);
+  pixTextCenter('DROPS APPLY TO YOUR CURRENT CAR · PAINTS UNLOCK IN THE DEALER', 196, 7);
+
+  backButton();
+
+  // reveal overlay
+  if (G.packReveal) {
+    ctx.fillStyle = 'rgba(5,5,12,0.9)';
+    ctx.fillRect(0, 0, W, H);
+    const rv = G.packReveal;
+    ctx.fillStyle = rv.color;
+    pixTextCenter(rv.label, 96, 22);
+    ctx.fillStyle = PAL.text;
+    pixTextCenter(rv.sub, 132, 10);
+    if (rv.car) {
+      const c = CAR_BY_ID[rv.car];
+      drawCarSprite(c, 240 - c.sprite[0].length, 88 - carHeight(c) * 2, c.pal, G.time * 8, 2);
+    }
+    ctx.fillStyle = Math.floor(G.time * 2) % 2 === 0 ? PAL.text : PAL.dim;
+    pixTextCenter('TAP TO CONTINUE', 176, 10);
+    hits.length = 0;
+    hits.push({ x: 0, y: 0, w: W, h: H, action: 'packclose' });
+  }
+
+  drawHUDFlash();
 }
 
 // ------------------------------------------------------------
@@ -2292,14 +2520,15 @@ function drawDealer() {
 
   // action button
   const bx = 140, by = 174, bw = 200, bh = 34;
-  let label, color;
+  let label, color, tappable = !selected;
   if (selected) { label = 'SELECTED'; color = PAL.dim; }
   else if (owned) { label = 'SELECT'; color = PAL.green; }
+  else if (car.packOnly) { label = 'PACK EXCLUSIVE'; color = '#ff9a5c'; tappable = false; }
   else { label = 'BUY $' + car.price; color = G.cash >= car.price ? PAL.cash : PAL.red; }
   panel(bx, by, bw, bh, color);
   ctx.fillStyle = color;
   pixTextCenter(label, by + 11, 12);
-  if (!selected) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'dealeraction' });
+  if (tappable) hits.push({ x: bx, y: by, w: bw, h: bh, action: 'dealeraction' });
 
   // paint shop for owned cars
   if (owned) {
@@ -2311,7 +2540,8 @@ function drawDealer() {
   }
 
   // car NFTs: mint with FUEL (burned), tradeable on any marketplace
-  if (mwaSupported) {
+  // (pack exclusives are not mintable on-chain in v1)
+  if (mwaSupported && G.dealerIdx < CAR_MODELS) {
     const isNft = G.nftModels.includes(G.dealerIdx);
     const nx = 20, ny = 214, nw = 110, nh = 40;
     if (isNft) {
@@ -2368,22 +2598,24 @@ function drawWallet() {
     { id: 'wallet', label: 'WALLET' },
     { id: 'board', label: 'BOARD' },
     { id: 'duel', label: 'DUEL' },
-    { id: 'ref', label: 'REFERRAL' },
+    { id: 'market', label: 'MARKET' },
+    { id: 'ref', label: 'REFER' },
   ];
   tabs.forEach((t, i) => {
-    const bx = 14 + i * 102, by = 30, bw = 96, bh = 20;
+    const bx = 14 + i * 82, by = 30, bw = 78, bh = 20;
     const active = G.chainTab === t.id;
     panel(bx, by, bw, bh, active ? PAL.nos : PAL.border);
     ctx.fillStyle = active ? PAL.nos : PAL.dim;
     pixTextCenter(t.label, by + 6, 8, bx + bw / 2);
     hits.push({ x: bx, y: by, w: bw, h: bh, action: 'chaintab', idx: t.id });
   });
-  chainButton(422, 30, 44, 20, G.chainLoading ? '...' : 'SYNC', PAL.dim, 'chainrefresh');
+  chainButton(424, 30, 42, 20, G.chainLoading ? '...' : 'SYNC', PAL.dim, 'chainrefresh');
 
   const tab = G.chainTab;
   if (tab === 'wallet') drawChainWallet();
   else if (tab === 'board') drawChainBoard();
   else if (tab === 'duel') drawChainDuel();
+  else if (tab === 'market') drawChainMarket();
   else drawChainRef();
 
   if (G.chainMsg) {
@@ -2553,6 +2785,58 @@ function drawChainDuel() {
   ctx.fillStyle = PAL.dim;
   pixText('FORGET THIS DUEL', 24, 166, 7);
   hits.push({ x: 24, y: 162, w: 110, h: 14, action: 'duelclear' });
+}
+
+// player-to-player car NFT market (3% fee burned)
+function drawChainMarket() {
+  if (!mwaSupported) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('THE NFT MARKET RUNS ON THE ANDROID / SEEKER BUILD', 110, 9);
+    return;
+  }
+  if (!G.chainCfg) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter(G.chainLoading ? 'LOADING...' : 'PROGRAM NOT LIVE YET', 110, 9);
+    return;
+  }
+  ctx.fillStyle = PAL.dim;
+  pixText('OPEN LISTINGS · 3% FEE BURNED', 24, 56, 7);
+
+  const me = sol.address;
+  if (G.listings.length === 0) {
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('NO CARS ON THE MARKET - LIST YOURS!', 92, 8);
+  }
+  G.listings.slice(0, 5).forEach((l, i) => {
+    const y = 68 + i * 18;
+    const mine = me && l.seller.toBase58() === me;
+    const car = CARS[l.model];
+    ctx.fillStyle = mine ? PAL.green : PAL.text;
+    pixText((car ? car.name : '?') + ' #' + (l.index + 1), 24, y, 8);
+    ctx.fillStyle = PAL.cash;
+    pixText((l.price / 10 ** FUEL_DECIMALS).toFixed(0) + ' FUEL', 160, y, 8);
+    ctx.fillStyle = PAL.dim;
+    pixText(mine ? 'YOU' : l.seller.toBase58().slice(0, 4) + '..', 246, y, 8);
+    if (mine) {
+      chainButton(310, y - 3, 70, 14, 'CANCEL', PAL.red, 'marketcancel', i);
+    } else {
+      chainButton(310, y - 3, 70, 14, sol.busy ? '...' : 'BUY', PAL.green, 'marketbuy', i);
+    }
+  });
+
+  // list one of my NFTs
+  const listedMints = G.listings.filter(l => me && l.seller.toBase58() === me).map(l => l.mint.toBase58());
+  const unlisted = G.nftInstances.find(n => !listedMints.includes(n.mint.toBase58()));
+  if (unlisted) {
+    const car = CARS[unlisted.model];
+    ctx.fillStyle = PAL.dim;
+    pixText('SELL: ' + (car ? car.name : '?') + ' #' + (unlisted.index + 1), 24, 166, 8);
+    chainButton(200, 160, 110, 20, LIST_PRICES[G.listPriceIdx] + ' FUEL >', PAL.cash, 'marketprice');
+    chainButton(320, 160, 110, 20, sol.busy ? '...' : 'LIST IT', PAL.green, 'marketlist');
+  } else if (sol.connected) {
+    ctx.fillStyle = PAL.dim;
+    pixText('NO UNLISTED CAR NFTS IN YOUR WALLET', 24, 166, 8);
+  }
 }
 
 function drawChainRef() {
@@ -2748,6 +3032,7 @@ function render() {
     case 'garage': drawGarage(); break;
     case 'tune': drawTune(); break;
     case 'dealer': drawDealer(); break;
+    case 'shop': drawShop(); break;
     case 'wallet': drawWallet(); break;
     case 'results': drawResults(); break;
     default:
