@@ -148,6 +148,10 @@ CARS.push({
   traction: 12500, drag: 0.32, wheelRadius: 0.33,
   pal: { b: '#f4c542', h: '#181820', d: '#8a6a1a', w: '#aee6ff' },
 });
+// torque monsters pull the front wheels up on launch
+CARS[1].wheelie = true; // muscle
+CARS[4].wheelie = true; // dragster
+CARS[6].wheelie = true; // bullet
 const CAR_BY_ID = Object.fromEntries(CARS.map(c => [c.id, c]));
 
 // ------------------------------------------------------------
@@ -422,6 +426,15 @@ const G = {
   listPriceIdx: 1,
   payCur: 0,             // selected payment currency (FUEL/SOL/SKR)
   solBal: 0, skrBal: 0,
+  // flow & presentation upgrades
+  tutorialDone: false,   // guided first race done (persisted)
+  daily: null,           // daily challenges {date, ch:[..]} (persisted)
+  weather: 'dry',        // dry | wet, rolled per race
+  zoom: 1,               // dynamic race camera
+  replay: null,          // victory replay {t}
+  gearPopT: 0,           // gear digit pop animation
+  edgeFlash: null,       // {t, color} screen border flash
+  wheelie: 0,            // 0..1 front lift on launch
   // ranked mode (persisted)
   rp: 0, rankedW: 0, rankedL: 0, rankedMonth: '',
   rankedOpp: null,       // matched opponent {name, et, rp, car}
@@ -458,6 +471,8 @@ function loadSave() {
       if (s.paint) G.paint = s.paint;
       if (s.tune) G.tune = s.tune;
       if (typeof s.distIdx === 'number') G.distIdx = Math.min(DISTANCES.length - 1, s.distIdx);
+      if (typeof s.tutorialDone === 'boolean') G.tutorialDone = s.tutorialDone;
+      if (s.daily && s.daily.date && Array.isArray(s.daily.ch)) G.daily = s.daily;
       if (Array.isArray(s.unlockedPaints)) G.unlockedPaints = s.unlockedPaints;
       if (typeof s.pity === 'number') G.pity = s.pity;
       if (typeof s.packsOpened === 'number') G.packsOpened = s.packsOpened;
@@ -486,7 +501,90 @@ function save() {
       paint: G.paint, tune: G.tune, distIdx: G.distIdx,
       rp: G.rp, rankedW: G.rankedW, rankedL: G.rankedL, rankedMonth: G.rankedMonth,
       unlockedPaints: G.unlockedPaints, pity: G.pity, packsOpened: G.packsOpened,
+      tutorialDone: G.tutorialDone, daily: G.daily,
     }));
+  } catch {}
+}
+
+// ------------------------------------------------------------
+// Daily challenges — 3 per day, seeded from the date
+// ------------------------------------------------------------
+const DAILY_POOL = [
+  { id: 'wins', text: 'WIN # QUICK RACES', goals: [2, 3], reward: 1200 },
+  { id: 'plaunch', text: '# PERFECT LAUNCHES', goals: [2, 3], reward: 1000 },
+  { id: 'pshift', text: '# PERFECT SHIFTS', goals: [6, 10], reward: 1000 },
+  { id: 'races', text: 'FINISH # RACES', goals: [3, 5], reward: 800 },
+  { id: 'hot', text: '# HOT-TIRE LAUNCHES', goals: [2, 3], reward: 1000 },
+  { id: 'beat', text: 'RUN UNDER #s (1/4)', goals: [14, 13], reward: 1500 },
+];
+
+function ensureDaily() {
+  const key = new Date().toISOString().slice(0, 10);
+  if (G.daily && G.daily.date === key) return;
+  let s = 0;
+  for (const c of key) s = (s * 31 + c.charCodeAt(0)) >>> 0;
+  const rnd = () => {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pool = [...DAILY_POOL];
+  const ch = [];
+  for (let i = 0; i < 3; i++) {
+    const def = pool.splice(Math.floor(rnd() * pool.length), 1)[0];
+    const goal = def.goals[Math.floor(rnd() * def.goals.length)];
+    ch.push({
+      id: def.id, goal, prog: 0, done: false, reward: def.reward,
+      text: def.text.replace('#', def.id === 'beat' ? goal.toFixed(1) : goal),
+    });
+  }
+  G.daily = { date: key, ch };
+  save();
+}
+
+function dailyProgress(id, amt = 1, value) {
+  if (!G.daily) return;
+  for (const c of G.daily.ch) {
+    if (c.id !== id || c.done) continue;
+    if (id === 'beat') {
+      if (value !== undefined && value < c.goal) c.prog = c.goal;
+    } else {
+      c.prog = Math.min(c.goal, c.prog + amt);
+    }
+    if (c.prog >= c.goal) {
+      c.done = true;
+      G.cash += c.reward;
+      setFlash('DAILY DONE! +$' + c.reward, PAL.cash);
+      buzz(50);
+    }
+  }
+  save();
+}
+
+// position of this run at time t, from the ghost trace (10 samples/s)
+function traceAt(t) {
+  const g = G.trace;
+  if (!g.length) return G.pos;
+  const i = Math.min(Math.max(0, t * 10), g.length - 1);
+  const i0 = Math.floor(i);
+  return g[i0] + (g[Math.min(i0 + 1, g.length - 1)] - g[i0]) * (i - i0);
+}
+
+// short UI beep (christmas tree, etc.)
+function beepTone(freq, dur) {
+  if (!AU.ok || G.muted) return;
+  try {
+    const o = AU.ctx.createOscillator();
+    const g = AU.ctx.createGain();
+    o.type = 'square';
+    o.frequency.value = freq;
+    g.gain.value = 0.07;
+    o.connect(g);
+    g.connect(AU.ctx.destination);
+    o.start();
+    g.gain.setTargetAtTime(0, AU.ctx.currentTime + dur, 0.02);
+    o.stop(AU.ctx.currentTime + dur + 0.1);
   } catch {}
 }
 
@@ -696,7 +794,7 @@ function tapAnywhere(x, y, isKey) {
     if (h && h.action === 'postrecord') { postRaceRecord(); return; }
     if (h && h.action === 'duelsubmit') { doDuelSubmit(); return; }
     if (h && h.action === 'chainsubmit') { doChainSubmitRanked(); return; }
-    if (G.time > 0.6) {
+    if (G.time > 0.4) {
       if (G.mode === 'career') gotoScreen('career');
       else if (G.mode === 'duel') { gotoScreen('wallet'); G.chainTab = 'duel'; refreshChain(); }
       else if (G.mode === 'ranked' || G.mode === 'chainrank') gotoScreen('ranked');
@@ -704,7 +802,11 @@ function tapAnywhere(x, y, isKey) {
     }
     return;
   }
-  if (G.screen === 'staging' || G.screen === 'race') return;
+  if (G.screen === 'staging' || G.screen === 'race') {
+    const h = hitAt(x, y);
+    if (h && h.action === 'restart' && !G.finished) beginStaging();
+    return;
+  }
   if (isKey) {
     if (G.screen === 'menu') gotoScreen('career');
     else if (G.screen === 'career') startCareerRace();
@@ -1187,6 +1289,12 @@ function beginStaging() {
   G.tireTemp = 0; G.tireBonus = 1;
   G.rt = null;
   G.slowmo = false; G.finishFlash = 0;
+  G.replay = null;
+  G.zoom = 1;
+  G.wheelie = 0;
+  G.gearPopT = 0;
+  G.edgeFlash = null;
+  G.weather = Math.random() < 0.25 ? 'wet' : 'dry';
   controls.classList.remove('hidden');
   const hasNos = G.garage[G.carId].nitro > 0;
   btnNos.classList.toggle('hidden', !hasNos);
@@ -1241,9 +1349,13 @@ function launch() {
   G.rt = G.throttle ? 0 : null;
   // burnout payoff: hot tires grip, overheated tires don't
   G.tireBonus = G.tireTemp >= 0.55 && G.tireTemp < 1.0 ? 1.06 : G.tireTemp >= 1.0 ? 0.97 : 1;
+  beepTone(990, 0.25); // green!
+  if (G.tireBonus > 1) dailyProgress('hot');
   if (G.launchRpm >= S.launchLo && G.launchRpm <= S.launchHi) {
     G.launchKind = 'perfect';
     setFlash('PERFECT LAUNCH!', '#5cff8a');
+    G.edgeFlash = { t: 0.3, color: PAL.nos };
+    dailyProgress('plaunch');
     buzz(60);
   } else if (G.launchRpm < 0.38 * S.redline) {
     G.launchKind = 'bog';
@@ -1265,10 +1377,13 @@ function shiftUp() {
   const early = G.rpm < 0.78 * S.redline;
   G.gear++;
   G.shiftTimer = perfect ? S.perfectShiftTime : S.shiftTime;
+  G.gearPopT = 0.3;
   if (perfect) {
     G.perfectShifts++;
     setFlash('PERFECT SHIFT!', '#5cff8a');
+    G.edgeFlash = { t: 0.25, color: PAL.green };
     spawnFlame(false);
+    dailyProgress('pshift');
     buzz(30);
   } else if (early) {
     setFlash('EARLY SHIFT', '#ff9a5c');
@@ -1285,6 +1400,7 @@ function shiftDown() {
   }
   G.gear--;
   G.shiftTimer = S.shiftTime * 0.7;
+  G.gearPopT = 0.3;
 }
 
 function fireNos() {
@@ -1364,6 +1480,7 @@ function applyRewards() {
       total = Math.round(d.lose * pay);
       lines.push('CONSOLATION $' + total);
     }
+    if (won) dailyProgress('wins');
   }
   if (G.launchKind === 'perfect') { total += 100; lines.push('LAUNCH $100'); }
   if (G.perfectShifts > 0) {
@@ -1444,6 +1561,7 @@ function updatePlayer(dt) {
     if (G.nosTimer > 0) tq *= S.nosPower;
     force = tq * ratio * 0.90 / S.wheelRadius;
     let grip = S.traction * G.tireBonus;
+    if (G.weather === 'wet') grip *= 0.9;
     if (G.spinTimer > 0) grip *= 0.55;
     if (G.launchKind === 'perfect' && G.raceT < 2.5) grip *= 1.12;
     if (force > grip) {
@@ -1470,12 +1588,19 @@ function updatePlayer(dt) {
     G.trace.push(Math.round(G.pos * 10) / 10);
   }
 
+  // front wheels up while the launch torque peaks
+  const wTarget = S.car.wheelie && G.raceT < 1.3 && G.throttle && G.launchKind !== 'bog' ? 1 : 0;
+  G.wheelie += (wTarget - G.wheelie) * Math.min(1, dt * (wTarget ? 6 : 4));
+
   if (!G.finished && G.pos >= G.distanceM) {
     G.finished = true;
     G.et = G.raceT;
     G.trap = G.speed * 3.6;
     G.finishFlash = 0.18;
     buzz([40, 60, 40]);
+    if (!G.tutorialDone) { G.tutorialDone = true; save(); }
+    dailyProgress('races');
+    if (G.distanceM === QUARTER_MILE) dailyProgress('beat', 0, G.et);
     const key = bestKey();
     if (!G.best[key] || G.et < G.best[key]) {
       G.best[key] = G.et;
@@ -1554,8 +1679,12 @@ function update(dt) {
   }
   updateParticles(dt);
 
+  if (G.gearPopT > 0) G.gearPopT -= dt;
+  if (G.edgeFlash) { G.edgeFlash.t -= dt; if (G.edgeFlash.t <= 0) G.edgeFlash = null; }
+
   if (G.screen === 'staging') {
     updatePlayer(dt);
+    G.zoom += (1 - G.zoom) * dt * 3;
     if (G.stage === 'burnout') {
       G.burnT += dt;
       if (G.burnT >= 3.0) {
@@ -1565,23 +1694,47 @@ function update(dt) {
         else if (G.tireTemp >= 1.0) setFlash('OVERHEATED!', '#ff9a5c');
       }
     } else {
+      const prev = G.treeT;
       G.treeT += dt;
+      for (const a of [TREE.amber1, TREE.amber2, TREE.amber3]) {
+        if (prev < a && G.treeT >= a) beepTone(660, 0.12);
+      }
       if (G.treeT >= TREE.green) launch();
     }
   } else if (G.screen === 'race') {
-    // photo-finish slow motion when it's neck and neck near the stripe
-    G.slowmo = G.mode !== 'duel' && !G.finished &&
-      G.distanceM - G.pos < 30 && Math.abs(G.pos - G.aiPos) < 8;
-    const rdt = G.slowmo ? dt * 0.35 : dt;
-    G.raceT += rdt;
-    updatePlayer(rdt);
-    updateAI(rdt);
-    if (G.finishFlash > 0) G.finishFlash -= dt;
-    G.wheelFrame += G.speed * rdt * 3;
-    if (G.finished && G.raceT >= G.et + 1.6) {
-      gotoScreen('results');
-      G.throttle = false;
-      applyRewards();
+    if (G.replay) {
+      // victory replay: re-run the last second of the finish in slow-mo
+      G.replay.t += dt * 0.4;
+      const rt = G.replay.t;
+      const prevPos = G.pos;
+      G.pos = traceAt(rt);
+      if (G.mode !== 'duel' && G.mode !== 'chainrank') {
+        G.aiPos = G.distanceM * Math.pow(Math.min(rt, G.aiEt) / G.aiEt, 1.55);
+      }
+      G.wheelFrame += Math.max(0, G.pos - prevPos) * 3;
+      G.zoom += (1.22 - G.zoom) * dt * 4;
+      if (G.finishFlash > 0) G.finishFlash -= dt;
+      if (rt >= G.et + 0.3) {
+        gotoScreen('results');
+        G.throttle = false;
+        applyRewards();
+      }
+    } else {
+      // photo-finish slow motion when it's neck and neck near the stripe
+      G.slowmo = G.mode !== 'duel' && !G.finished &&
+        G.distanceM - G.pos < 30 && Math.abs(G.pos - G.aiPos) < 8;
+      const rdt = G.slowmo ? dt * 0.35 : dt;
+      G.raceT += rdt;
+      updatePlayer(rdt);
+      updateAI(rdt);
+      if (G.finishFlash > 0) G.finishFlash -= dt;
+      G.wheelFrame += G.speed * rdt * 3;
+      // dynamic camera: punchy at launch, wide at speed
+      const zTarget = G.raceT < 0.4 ? 1.06 : 1.05 - Math.min(G.speed / 65, 1) * 0.17;
+      G.zoom += (zTarget - G.zoom) * dt * 3;
+      if (G.finished && G.raceT >= G.et + 0.8) {
+        G.replay = { t: Math.max(0, G.et - 1.0) };
+      }
     }
   }
   updateAudio();
@@ -1650,14 +1803,44 @@ function drawWheel(x, y, size, frame, scale) {
   }
 }
 
+// crowd stand above the fence at a world position (start + finish)
+function drawStand(sx, T) {
+  if (sx < -120 || sx > W + 40) return;
+  ctx.fillStyle = '#14141c';
+  ctx.fillRect(sx, 52, 96, 26);
+  ctx.strokeStyle = T.fence;
+  ctx.strokeRect(sx + 0.5, 52.5, 95, 25);
+  const crowd = ['#e0a63a', '#7ec8ff', '#ff5c7a', '#5cff8a', '#e8e8f0', '#ff9a5c'];
+  const frame = Math.floor(G.time * 5);
+  for (let r = 0; r < 3; r++) {
+    for (let i = 0; i < 15; i++) {
+      const seed = (r * 31 + i * 7 + Math.floor(sx)) & 1023;
+      ctx.fillStyle = crowd[(seed + (((seed * 13 + frame) % 11 === 0) ? 1 : 0)) % crowd.length];
+      const bounce = (seed * 13 + frame) % 17 === 0 ? -1 : 0;
+      ctx.fillRect(sx + 4 + i * 6, 56 + r * 7 + bounce, 3, 3);
+    }
+  }
+}
+
+const EXT = 90; // extra horizontal draw range for the zoom camera
+
 function drawRaceView() {
   const camX = G.pos * PX_PER_M - PLAYER_SCREEN;
   const T = THEMES[G.theme];
 
+  // pre-fill so the zoomed-out camera never shows raw canvas
+  ctx.fillStyle = T.sky1;
+  ctx.fillRect(0, 0, W, 160);
+  ctx.save();
+  const z = G.zoom || 1;
+  ctx.translate(PLAYER_SCREEN, 150);
+  ctx.scale(z, z);
+  ctx.translate(-PLAYER_SCREEN, -150);
+
   const grad = ctx.createLinearGradient(0, 0, 0, 80);
   grad.addColorStop(0, T.sky1); grad.addColorStop(1, T.sky2);
   ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, W, 80);
+  ctx.fillRect(-EXT, 0, W + 2 * EXT, 80);
 
   if (T.night) {
     ctx.fillStyle = '#ffffff44';
@@ -1683,7 +1866,7 @@ function drawRaceView() {
   }
 
   const cityOff = Math.floor(camX * 0.15) % 60;
-  for (let i = -1; i < 10; i++) {
+  for (let i = -3; i < 12; i++) {
     const bx = i * 60 - cityOff;
     const h = 16 + ((i * 37 + 100) % 22);
     ctx.fillStyle = T.bld;
@@ -1698,26 +1881,34 @@ function drawRaceView() {
     }
   }
   ctx.fillStyle = T.ground;
-  ctx.fillRect(0, 70, W, 8);
+  ctx.fillRect(-EXT, 70, W + 2 * EXT, 8);
 
   const fenceOff = Math.floor(camX * 0.5) % 12;
   ctx.fillStyle = T.fence;
-  ctx.fillRect(0, 78, W, 3);
-  for (let x = -fenceOff; x < W; x += 12) ctx.fillRect(x, 81, 2, 7);
+  ctx.fillRect(-EXT, 78, W + 2 * EXT, 3);
+  for (let x = -EXT - fenceOff; x < W + EXT; x += 12) ctx.fillRect(x, 81, 2, 7);
+
+  // grandstands with a cheering crowd at the start and the finish
+  drawStand(-40 - camX, T);
+  drawStand(G.distanceM * PX_PER_M - 30 - camX, T);
 
   ctx.fillStyle = T.road;
-  ctx.fillRect(0, TRACK_TOP, W, TRACK_BOT - TRACK_TOP);
+  ctx.fillRect(-EXT, TRACK_TOP, W + 2 * EXT, TRACK_BOT - TRACK_TOP);
+  if (G.weather === 'wet') {
+    ctx.fillStyle = 'rgba(90,140,200,0.10)';
+    ctx.fillRect(-EXT, TRACK_TOP, W + 2 * EXT, TRACK_BOT - TRACK_TOP);
+  }
   const dashOff = Math.floor(camX) % 24;
   ctx.fillStyle = PAL.roadLine;
-  for (let x = -dashOff; x < W; x += 24) ctx.fillRect(x, 118, 12, 2);
+  for (let x = -EXT - dashOff; x < W + EXT; x += 24) ctx.fillRect(x, 118, 12, 2);
   ctx.fillStyle = '#40404e';
-  ctx.fillRect(0, TRACK_TOP, W, 2);
-  ctx.fillRect(0, TRACK_BOT - 2, W, 2);
+  ctx.fillRect(-EXT, TRACK_TOP, W + 2 * EXT, 2);
+  ctx.fillRect(-EXT, TRACK_BOT - 2, W + 2 * EXT, 2);
 
   const lastMark = Math.ceil(G.distanceM / 100) * 100;
   for (let m = 100; m <= lastMark; m += 100) {
     const sx = m * PX_PER_M - camX;
-    if (sx > -20 && sx < W + 20) {
+    if (sx > -EXT - 20 && sx < W + EXT + 20) {
       ctx.fillStyle = '#55556a';
       ctx.fillRect(sx, TRACK_TOP, 2, TRACK_BOT - TRACK_TOP);
       ctx.fillStyle = PAL.dim;
@@ -1725,22 +1916,22 @@ function drawRaceView() {
     }
   }
   const fx = G.distanceM * PX_PER_M - camX;
-  if (fx > -30 && fx < W + 30) {
+  if (fx > -EXT - 30 && fx < W + EXT + 30) {
     for (let y = TRACK_TOP; y < TRACK_BOT; y += 4) {
       for (let i = 0; i < 2; i++) {
         ctx.fillStyle = ((y / 4 + i) % 2 === 0) ? '#fff' : '#111';
         ctx.fillRect(fx + i * 4, y, 4, 4);
       }
     }
-  }
-
-  // speed lines at high velocity
-  if (G.screen === 'race' && G.speed > 42) {
-    ctx.fillStyle = 'rgba(220,220,240,0.25)';
-    for (let i = 0; i < 5; i++) {
-      const ly = 92 + ((i * 37 + Math.floor(G.raceT * 60) * 13) % 56);
-      const lx = (i * 131 + Math.floor(G.raceT * 900)) % (W + 60) - 30;
-      ctx.fillRect(W - lx, ly, 14 + G.speed / 6, 1);
+    // camera flashes from the finish stand when the field arrives
+    if (G.distanceM - G.pos < 60) {
+      for (let i = 0; i < 3; i++) {
+        const seed = Math.floor(G.time * 12) * 7 + i * 13;
+        if (seed % 3 === 0) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(fx - 28 + (seed * 11) % 90, 54 + (seed * 5) % 20, 2, 2);
+        }
+      }
     }
   }
 
@@ -1779,7 +1970,26 @@ function drawRaceView() {
     ctx.closePath();
     ctx.fill();
   }
-  drawCarSprite(myCar, carX, carY, carPal(myCar), G.wheelFrame, 1);
+  if (G.wheelie > 0.03) {
+    // rotate the car up around the rear axle
+    const px = carX + myCar.wheels[0].x + myCar.wheels[0].s;
+    const py = PLAYER_BOTTOM;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(-G.wheelie * (myCar.id === 'dragster' ? 0.16 : 0.09));
+    ctx.translate(-px, -py);
+    drawCarSprite(myCar, carX, carY, carPal(myCar), G.wheelFrame, 1);
+    ctx.restore();
+  } else {
+    drawCarSprite(myCar, carX, carY, carPal(myCar), G.wheelFrame, 1);
+  }
+  // wet track: light reflections under the car
+  if (G.weather === 'wet') {
+    ctx.fillStyle = 'rgba(255,247,174,0.12)';
+    ctx.fillRect(carX + myCar.sprite[0].length - 2, PLAYER_BOTTOM + 1, 2, 5);
+    ctx.fillStyle = 'rgba(255,64,64,0.12)';
+    ctx.fillRect(carX, PLAYER_BOTTOM + 1, 2, 5);
+  }
 
   for (const p of G.particles) {
     if (p.kind === 'smoke') {
@@ -1795,6 +2005,33 @@ function drawRaceView() {
     }
   }
 
+  ctx.restore(); // end of zoom camera — screen-space effects below
+
+  // speed lines at high velocity
+  if (G.screen === 'race' && G.speed > 42) {
+    ctx.fillStyle = 'rgba(220,220,240,0.25)';
+    for (let i = 0; i < 5; i++) {
+      const ly = 92 + ((i * 37 + Math.floor(G.raceT * 60) * 13) % 56);
+      const lx = (i * 131 + Math.floor(G.raceT * 900)) % (W + 60) - 30;
+      ctx.fillRect(W - lx, ly, 14 + G.speed / 6, 1);
+    }
+  }
+
+  // rain streaks on wet races
+  if (G.weather === 'wet') {
+    ctx.strokeStyle = 'rgba(160,190,230,0.28)';
+    ctx.lineWidth = 1;
+    const frame = Math.floor(G.time * 30);
+    for (let i = 0; i < 22; i++) {
+      const rx = ((i * 97 + frame * 23) % (W + 40)) - 20;
+      const ry = (i * 53 + frame * 31) % TRACK_BOT;
+      ctx.beginPath();
+      ctx.moveTo(rx, ry);
+      ctx.lineTo(rx - 2, ry + 7);
+      ctx.stroke();
+    }
+  }
+
   // NOS tint + finish flash overlays
   if (G.nosTimer > 0) {
     ctx.fillStyle = 'rgba(130,90,255,0.08)';
@@ -1805,9 +2042,66 @@ function drawRaceView() {
     ctx.fillRect(0, 0, W, TRACK_BOT);
   }
 
-  if ((G.screen === 'staging' && G.stage === 'tree') || (G.screen === 'race' && G.raceT < 1.2)) {
+  if ((G.screen === 'staging' && G.stage === 'tree') || (G.screen === 'race' && G.raceT < 1.2 && !G.replay)) {
     drawTree();
   }
+}
+
+// screen-space race UI: restart chip, coast/replay banner, edge flash
+function drawRaceOverlays() {
+  if (G.screen !== 'staging' && G.screen !== 'race') return;
+  if (!G.finished) {
+    panel(6, 4, 66, 14, PAL.border);
+    ctx.fillStyle = PAL.dim;
+    pixTextCenter('RESTART', 8, 7, 39);
+    hits.push({ x: 6, y: 4, w: 66, h: 14, action: 'restart' });
+  }
+  if (G.finished) {
+    const won = G.et < G.aiEt;
+    if (G.replay) {
+      ctx.fillStyle = PAL.dim;
+      pixText('REPLAY', 10, 8, 9);
+    }
+    ctx.fillStyle = G.mode === 'duel' || G.mode === 'chainrank' ? PAL.nos : won ? PAL.green : PAL.red;
+    pixTextCenter((G.mode === 'duel' || G.mode === 'chainrank' ? 'RUN ' : won ? 'WIN ' : 'LOSS ') + G.et.toFixed(3) + 's', 40, 16);
+  }
+  if (G.edgeFlash) {
+    ctx.globalAlpha = Math.min(1, G.edgeFlash.t * 5);
+    ctx.strokeStyle = G.edgeFlash.color;
+    ctx.lineWidth = 4;
+    ctx.strokeRect(2, 2, W - 4, TRACK_BOT - 4);
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 1;
+  }
+}
+
+// guided first race: big prompts + a blinking arrow to the pedals
+function drawTutorial() {
+  if (G.tutorialDone) return;
+  if (G.screen !== 'staging' && G.screen !== 'race') return;
+  let text = '', arrowRight = true;
+  if (G.screen === 'staging' && G.stage === 'burnout') {
+    text = G.tireTemp < 0.55 ? 'HOLD GAS - HEAT THE TIRES!' : 'TIRES HOT - EASE OFF!';
+  } else if (G.screen === 'staging') {
+    text = 'REV INTO THE GREEN ARC!';
+  } else if (!G.finished) {
+    if (G.rpm >= S.perfectLo) { text = 'SHIFT NOW!'; arrowRight = false; }
+    else text = 'HOLD GAS - WATCH THE SHIFT LIGHT';
+  }
+  if (!text) return;
+  const blink = Math.floor(G.time * 3) % 2 === 0;
+  ctx.fillStyle = blink ? PAL.amber : PAL.text;
+  pixTextCenter(text, 74, 12);
+  // arrow toward the relevant control (gas right / shift left)
+  const ax = arrowRight ? 420 : 60;
+  const bounce = blink ? 0 : 3;
+  ctx.fillStyle = PAL.amber;
+  ctx.beginPath();
+  ctx.moveTo(ax - 8, 128 + bounce);
+  ctx.lineTo(ax + 8, 128 + bounce);
+  ctx.lineTo(ax, 142 + bounce);
+  ctx.closePath();
+  ctx.fill();
 }
 
 function drawTree() {
@@ -1883,8 +2177,10 @@ function drawDashboard() {
   ctx.strokeRect(118.5, 172.5, 71, 49);
   ctx.fillStyle = PAL.dim;
   pixText('GEAR', 126, 177, 7);
-  ctx.fillStyle = G.shiftTimer > 0 ? PAL.dim : PAL.text;
-  pixText(G.shiftTimer > 0 ? '-' : String(G.gear), 146, 188, 28);
+  const pop = Math.max(0, G.gearPopT);
+  ctx.fillStyle = pop > 0.15 ? '#ffffff' : G.shiftTimer > 0 ? PAL.dim : PAL.text;
+  const gsz = Math.round(28 * (1 + pop * 1.1));
+  pixText(G.shiftTimer > 0 ? '-' : String(G.gear), 146 - pop * 8, 188 - pop * 10, gsz);
 
   // speed box
   ctx.fillStyle = PAL.panel;
@@ -2053,20 +2349,42 @@ function drawMenu() {
     hits.push({ x: bx, y: by, w: bw, h: bh, action: 'goto', idx: it.idx });
   });
 
-  // current car preview (right)
+  // showroom: current car big, on a lit floor with a reflection
+  ensureDaily();
   const car = S.car;
-  const sc = 2;
+  const sc = 3;
   const cw = car.sprite[0].length * sc;
-  const cx = 345 - cw / 2;
-  drawCarSprite(car, cx, 120 - carHeight(car) * sc, carPal(car), G.time * 8, sc);
+  const scx = 350 - cw / 2;
+  const floorY = 96;
+  const carH = carHeight(car) * sc;
+  drawCarSprite(car, scx, floorY - carH, carPal(car), G.time * 8, sc);
+  ctx.save();
+  ctx.translate(0, 2 * floorY);
+  ctx.scale(1, -1);
+  ctx.globalAlpha = 0.15;
+  drawCarSprite(car, scx, floorY - carH, carPal(car), G.time * 8, sc);
+  ctx.restore();
   ctx.fillStyle = '#2a2a34';
-  ctx.fillRect(240, 124, 210, 3);
+  ctx.fillRect(244, floorY, 212, 2);
   ctx.fillStyle = PAL.text;
-  pixTextCenter(car.name, 136, 12, 345);
+  pixTextCenter(car.name, 122, 11, 350);
   ctx.fillStyle = PAL.dim;
   const best = G.best[G.carId];
-  pixTextCenter(best ? 'BEST ' + best.toFixed(2) + 's' : 'NO TIME SET', 154, 8, 345);
-  pixTextCenter(Math.round(S.peakTorque) + 'NM · ' + Math.round(S.mass) + 'KG', 168, 8, 345);
+  pixTextCenter((best ? 'BEST ' + best.toFixed(2) + 's · ' : '') +
+    Math.round(S.peakTorque) + 'NM · ' + Math.round(S.mass) + 'KG', 136, 7, 350);
+
+  // daily challenges
+  ctx.fillStyle = PAL.cash;
+  pixText('DAILY CHALLENGES', 252, 152, 8);
+  if (G.daily) {
+    G.daily.ch.forEach((c, i) => {
+      const y = 166 + i * 15;
+      ctx.fillStyle = c.done ? PAL.green : PAL.text;
+      pixText((c.done ? '* ' : '· ') + c.text, 252, y, 7);
+      ctx.fillStyle = c.done ? PAL.green : PAL.dim;
+      pixText(c.done ? 'DONE' : c.prog + '/' + c.goal + ' · $' + c.reward, 408, y, 7);
+    });
+  }
 
   // sound toggle
   const sx = 380, sy = 232, sw = 86, sh = 18;
@@ -2076,7 +2394,7 @@ function drawMenu() {
   hits.push({ x: sx, y: sy, w: sw, h: sh, action: 'togglesound' });
 
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('3DAGI · v0.9 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
+  pixTextCenter('3DAGI · v1.2 · SOLANA ' + CLUSTER.toUpperCase(), 254, 7);
   drawHUDFlash();
 }
 
@@ -2406,11 +2724,17 @@ function drawCareer() {
   const sc = 2;
   drawCarSprite(rc, 390 - rc.sprite[0].length, 170 - carHeight(rc) * sc, RIVAL_PAL, G.time * 8, sc);
 
-  // your car hint
+  // your car hint + honest matchup check
   ctx.fillStyle = PAL.dim;
   pixText('YOUR CAR: ' + S.car.name, 76, 140, 8);
   const best = G.best[G.carId];
   if (best) pixText('YOUR BEST: ' + best.toFixed(2) + 's', 76, 154, 8);
+  const estimate = best || S.car.etHint;
+  if (estimate > stage.et + 0.2) {
+    ctx.fillStyle = PAL.amber;
+    pixText('RIVAL IS FASTER -', 210, 154, 8);
+    chainButton(330, 150, 90, 14, 'TUNE UP >', PAL.amber, 'goto', 'garage');
+  }
 
   // beaten bosses pay FUEL on-chain, once each
   if (mwaSupported) {
@@ -2556,8 +2880,26 @@ function drawTune() {
   const best = G.best[G.carId];
   pixText('BEST ' + (best ? best.toFixed(3) + 's' : '--'), 40, 150, 8);
 
+  // gear speed chart: which km/h band each gear covers with this
+  // final drive — shorter gearing squeezes the bars left
   ctx.fillStyle = PAL.dim;
-  pixTextCenter('SETUP SAVED PER CAR · TEST IT ON THE STRIP', 190, 7);
+  pixText('GEAR SPEEDS (KM/H)', 220, 160, 7);
+  const tops = S.gears.map(g => S.limiter / (60 * g * S.finalDrive) * 2 * Math.PI * S.wheelRadius * 3.6);
+  const maxV = tops[tops.length - 1] * 1.08;
+  S.gears.forEach((g, i) => {
+    const y = 172 + i * 6;
+    const from = i === 0 ? 0 : tops[i - 1] * (S.gears[i] / S.gears[i - 1]);
+    const x0 = 220 + from / maxV * 240;
+    const x1 = 220 + tops[i] / maxV * 240;
+    ctx.fillStyle = '#26263a';
+    ctx.fillRect(220, y, 240, 4);
+    ctx.fillStyle = ['#7ec8ff', '#5cff8a', '#ffd166', '#ff9a5c', '#ff5c7a', '#c9a8ff'][i % 6];
+    ctx.fillRect(x0, y, Math.max(2, x1 - x0), 4);
+    ctx.fillStyle = PAL.dim;
+    pixText(String(i + 1), 212, y - 1, 6);
+  });
+  ctx.fillStyle = PAL.dim;
+  pixText(Math.round(maxV) + '', 444, 172 + S.gears.length * 6, 6);
 
   const bx = 180, by = 214, bw = 120, bh = 26;
   panel(bx, by, bw, bh);
@@ -3029,6 +3371,10 @@ function drawStagingHints() {
   if (G.screen !== 'staging') return;
   ctx.fillStyle = PAL.text;
   pixTextCenter('VS ' + G.oppName + ' · ' + THEMES[G.theme].name, 34, 10);
+  if (G.weather === 'wet') {
+    ctx.fillStyle = '#8ce8e0';
+    pixTextCenter('WET TRACK - LESS GRIP!', 22, 8);
+  }
   if (G.stage === 'burnout') {
     ctx.fillStyle = Math.floor(G.time * 3) % 2 === 0 ? PAL.amber : PAL.dim;
     pixTextCenter('BURNOUT! REV TO HEAT THE TIRES', 48, 11);
@@ -3168,9 +3514,12 @@ function render() {
     case 'wallet': drawWallet(); break;
     case 'results': drawResults(); break;
     default:
+      hits.length = 0;
       drawRaceView();
       drawDashboard();
       drawStagingHints();
+      drawTutorial();
+      drawRaceOverlays();
       drawHUDFlash();
   }
 }
